@@ -5,6 +5,7 @@ import (
 
 	evdev "github.com/holoplot/go-evdev"
 
+	"github.com/andresousadotpt/texpand/internal/inputstate"
 	"github.com/andresousadotpt/texpand/internal/keymap"
 )
 
@@ -39,8 +40,9 @@ func (f *fakeLookup) Candidates(k string, buf []string) []string {
 
 // driver feeds synthetic events and records plans.
 type driver struct {
-	t *testing.T
-	c *Corrector
+	t       *testing.T
+	c       *Corrector
+	tracker *inputstate.Tracker
 	// every non-empty result, in order
 	results []Result
 }
@@ -48,13 +50,18 @@ type driver struct {
 func newDriver(t *testing.T, opts Options) *driver {
 	c := New(opts)
 	c.SetLookup(testLookup())
-	return &driver{t: t, c: c}
+	return &driver{t: t, c: c, tracker: inputstate.New(false)}
 }
 
 // send feeds one event, recording any non-empty result (plans can surface
 // on Shift release, so every event must be captured).
 func (d *driver) send(code evdev.EvCode, value int32) Result {
-	r := d.c.HandleEvent(KeyEvent{Code: code, Value: value})
+	return d.sendDevice("kbd", code, value)
+}
+
+func (d *driver) sendDevice(device string, code evdev.EvCode, value int32) Result {
+	mods := d.tracker.Handle(device, code, value)
+	r := d.c.HandleEvent(KeyEvent{Code: code, Value: value, Modifiers: mods})
 	if r.Plan != nil || r.Toggled {
 		d.results = append(d.results, r)
 	}
@@ -170,7 +177,7 @@ func TestCapsLockUppercase(t *testing.T) {
 
 func TestCapsLockSeededFromLED(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
-	d.c.SetCapsLock(true)
+	d.tracker.SetCaps(true)
 	res := d.typeString("zolw ")
 	expectPlan(t, res, 5, "ŻÓŁW ")
 }
@@ -251,30 +258,30 @@ func TestCtrlShortcutsInvalidate(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	d.typeString("zo")
 	// Ctrl+C while holding ctrl.
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTCTRL, Value: 1})
+	d.send(evdev.KEY_LEFTCTRL, 1)
 	d.key(evdev.KEY_C)
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTCTRL, Value: 0})
+	d.send(evdev.KEY_LEFTCTRL, 0)
 	expectNoPlan(t, d.typeString("lw "))
 }
 
 func TestCtrlHeldBlocksCorrection(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	d.typeString("zolw")
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTCTRL, Value: 1})
+	d.send(evdev.KEY_LEFTCTRL, 1)
 	res := d.key(evdev.KEY_SPACE) // Ctrl+Space: a shortcut, not a boundary
 	if res.Plan != nil {
 		t.Fatal("correction fired during Ctrl chord")
 	}
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTCTRL, Value: 0})
+	d.send(evdev.KEY_LEFTCTRL, 0)
 }
 
 func TestMetaAndAltInvalidate(t *testing.T) {
 	for _, mod := range []evdev.EvCode{evdev.KEY_LEFTMETA, evdev.KEY_LEFTALT} {
 		d := newDriver(t, DefaultOptions())
 		d.typeString("zo")
-		d.c.HandleEvent(KeyEvent{Code: mod, Value: 1})
+		d.send(mod, 1)
 		d.key(evdev.KEY_TAB)
-		d.c.HandleEvent(KeyEvent{Code: mod, Value: 0})
+		d.send(mod, 0)
 		expectNoPlan(t, d.typeString("lw "))
 	}
 }
@@ -327,6 +334,22 @@ func TestShiftedSeparatorDefersUntilShiftRelease(t *testing.T) {
 	}
 }
 
+func TestDeferredCorrectionWaitsForShiftOnEveryKeyboard(t *testing.T) {
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	d.sendDevice("kbd-a", evdev.KEY_LEFTSHIFT, 1)
+	d.sendDevice("kbd-b", evdev.KEY_RIGHTSHIFT, 1)
+	d.sendDevice("kbd-a", evdev.KEY_1, 1)
+	d.sendDevice("kbd-a", evdev.KEY_1, 0)
+	if r := d.sendDevice("kbd-a", evdev.KEY_LEFTSHIFT, 0); r.Plan != nil {
+		t.Fatalf("plan emitted while second keyboard still held Shift: %+v", r.Plan)
+	}
+	r := d.sendDevice("kbd-b", evdev.KEY_RIGHTSHIFT, 0)
+	if r.Plan == nil || r.Plan.Type != "żółw!" {
+		t.Fatalf("plan after final Shift release = %+v", r.Plan)
+	}
+}
+
 func TestAltGrHeldDefersCorrection(t *testing.T) {
 	// Fast typist: AltGr from the last diacritic is still held when Space
 	// lands. The plan must wait for the AltGr release.
@@ -363,7 +386,7 @@ func TestUndo(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
 
-	r := d.c.HandleEvent(KeyEvent{Code: evdev.KEY_BACKSPACE, Value: 1})
+	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan == nil || !r.Undo {
 		t.Fatalf("backspace after correction: %+v", r)
 	}
@@ -372,7 +395,7 @@ func TestUndo(t *testing.T) {
 	if r.Plan.Backspaces != 4 || r.Plan.Type != "zolw" {
 		t.Fatalf("undo plan = %+v", r.Plan)
 	}
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_BACKSPACE, Value: 0})
+	d.send(evdev.KEY_BACKSPACE, 0)
 
 	// The restored word must not be re-corrected at the next boundary.
 	expectNoPlan(t, d.typeString(" "))
@@ -383,7 +406,7 @@ func TestUndo(t *testing.T) {
 func TestUndoPreservesCase(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	expectPlan(t, d.typeString("Zolw!"), 5, "Żółw!")
-	r := d.c.HandleEvent(KeyEvent{Code: evdev.KEY_BACKSPACE, Value: 1})
+	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan == nil || r.Plan.Type != "Zolw" {
 		t.Fatalf("undo plan = %+v", r.Plan)
 	}
@@ -395,7 +418,7 @@ func TestUndoOnlyImmediately(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
 	d.typeString("a")
-	r := d.c.HandleEvent(KeyEvent{Code: evdev.KEY_BACKSPACE, Value: 1})
+	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan != nil {
 		t.Fatalf("undo after intervening key: %+v", r.Plan)
 	}
@@ -405,7 +428,7 @@ func TestSecondSeparatorCommits(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
 	expectNoPlan(t, d.typeString(" ")) // second space: no new plan
-	r := d.c.HandleEvent(KeyEvent{Code: evdev.KEY_BACKSPACE, Value: 1})
+	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan != nil {
 		t.Fatal("undo available after second separator")
 	}
@@ -416,7 +439,7 @@ func TestUndoDisabled(t *testing.T) {
 	opts.Undo = false
 	d := newDriver(t, opts)
 	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
-	r := d.c.HandleEvent(KeyEvent{Code: evdev.KEY_BACKSPACE, Value: 1})
+	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan != nil {
 		t.Fatal("undo fired although disabled")
 	}
@@ -431,18 +454,18 @@ func TestToggleShortcut(t *testing.T) {
 	opts.Toggle = sc
 	d := newDriver(t, opts)
 
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTCTRL, Value: 1})
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTALT, Value: 1})
-	r := d.c.HandleEvent(KeyEvent{Code: evdev.KEY_SLASH, Value: 1})
+	d.send(evdev.KEY_LEFTCTRL, 1)
+	d.send(evdev.KEY_LEFTALT, 1)
+	r := d.send(evdev.KEY_SLASH, 1)
 	if !r.Toggled {
 		t.Fatal("toggle shortcut not detected")
 	}
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_SLASH, Value: 0})
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTALT, Value: 0})
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTCTRL, Value: 0})
+	d.send(evdev.KEY_SLASH, 0)
+	d.send(evdev.KEY_LEFTALT, 0)
+	d.send(evdev.KEY_LEFTCTRL, 0)
 
 	// Plain slash is not a toggle.
-	r = d.c.HandleEvent(KeyEvent{Code: evdev.KEY_SLASH, Value: 1})
+	r = d.send(evdev.KEY_SLASH, 1)
 	if r.Toggled {
 		t.Fatal("bare slash toggled")
 	}
@@ -468,7 +491,7 @@ func TestExclusionCallback(t *testing.T) {
 
 func TestNoLookupNoCorrection(t *testing.T) {
 	c := New(DefaultOptions())
-	d := &driver{t: t, c: c} // dictionary still loading
+	d := &driver{t: t, c: c, tracker: inputstate.New(false)} // dictionary still loading
 	expectNoPlan(t, d.typeString("zolw "))
 }
 
@@ -476,9 +499,9 @@ func TestKeyRepeat(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	// "zol" then holding w: value 1 then repeats.
 	d.typeString("zol")
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_W, Value: 1})
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_W, Value: 2})
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_W, Value: 0})
+	d.send(evdev.KEY_W, 1)
+	d.send(evdev.KEY_W, 2)
+	d.send(evdev.KEY_W, 0)
 	// Buffer is "zolww" → no candidate → nothing.
 	expectNoPlan(t, d.typeString(" "))
 }
@@ -496,9 +519,10 @@ func TestOverflowNeverGrowsNorCorrects(t *testing.T) {
 
 func TestResetClearsState(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
-	d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTSHIFT, Value: 1}) // stuck shift
+	d.send(evdev.KEY_LEFTSHIFT, 1) // stuck shift
 	d.typeString("zol")
 	d.c.Reset() // keyboard hotplug
+	d.tracker.Reset(false)
 	expectNoPlan(t, d.typeString("w "))
 	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
 }

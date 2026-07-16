@@ -20,13 +20,15 @@ import (
 	evdev "github.com/holoplot/go-evdev"
 
 	"github.com/andresousadotpt/texpand/internal/fold"
+	"github.com/andresousadotpt/texpand/internal/inputstate"
 	"github.com/andresousadotpt/texpand/internal/keymap"
 )
 
 // KeyEvent is a single key event. Value: 0=release, 1=press, 2=repeat.
 type KeyEvent struct {
-	Code  evdev.EvCode
-	Value int32
+	Code      evdev.EvCode
+	Value     int32
+	Modifiers inputstate.Modifiers
 }
 
 // Plan is a text edit for the output backend: delete Backspaces characters
@@ -117,8 +119,7 @@ type Corrector struct {
 	// clears when a boundary or a fresh word start is typed.
 	suppressed bool
 
-	shift, ctrl, lalt, altgr, meta bool
-	caps                           bool
+	modifiers inputstate.Modifiers
 
 	undo    undoState
 	candBuf []string
@@ -177,9 +178,6 @@ func (c *Corrector) Enabled() bool { return c.enabled.Load() }
 // SetEnabled turns autocorrection on or off. Safe from any goroutine.
 func (c *Corrector) SetEnabled(v bool) { c.enabled.Store(v) }
 
-// SetCapsLock seeds the Caps Lock state (read from the keyboard LED).
-func (c *Corrector) SetCapsLock(on bool) { c.caps = on }
-
 // Reset clears all transient typing state (keyboard hotplug, external
 // text expansion, etc.). Modifier *held* state is cleared too, matching
 // the expander's behaviour on device changes.
@@ -188,7 +186,7 @@ func (c *Corrector) Reset() {
 	c.suppressed = false
 	c.undo.active = false
 	c.pending = nil
-	c.shift, c.ctrl, c.lalt, c.altgr, c.meta = false, false, false, false, false
+	c.modifiers = inputstate.Modifiers{Caps: c.modifiers.Caps}
 }
 
 // Invalidate marks the current word as unreliable (e.g. the expander just
@@ -209,7 +207,7 @@ func (c *Corrector) clearWord() {
 // maybeReleasePending emits a deferred correction once no output-altering
 // modifier (Shift, AltGr) is physically held anymore.
 func (c *Corrector) maybeReleasePending() Result {
-	if c.pending == nil || c.shift || c.altgr {
+	if c.pending == nil || c.modifiers.Shift || c.modifiers.AltGr {
 		return Result{}
 	}
 	plan := c.pending
@@ -245,22 +243,18 @@ func (c *Corrector) separator(code evdev.EvCode, ch rune, hasChar bool) (sep run
 // HandleEvent processes one key event. The ordinary-typing path (letters,
 // modifiers) performs no allocation and no dictionary access.
 func (c *Corrector) HandleEvent(ev KeyEvent) Result {
+	c.modifiers = ev.Modifiers
 	// Modifier state tracks presses and releases.
 	switch ev.Code {
 	case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
-		c.shift = ev.Value > 0
 		return c.maybeReleasePending()
 	case evdev.KEY_LEFTCTRL, evdev.KEY_RIGHTCTRL:
-		c.ctrl = ev.Value > 0
 		return Result{}
 	case evdev.KEY_LEFTALT:
-		c.lalt = ev.Value > 0
 		return Result{}
 	case evdev.KEY_RIGHTALT: // AltGr on the Polish Programmer layout
-		c.altgr = ev.Value > 0
 		return c.maybeReleasePending()
 	case evdev.KEY_LEFTMETA, evdev.KEY_RIGHTMETA:
-		c.meta = ev.Value > 0
 		return Result{}
 	}
 
@@ -273,16 +267,13 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	c.pending = nil
 
 	if ev.Code == evdev.KEY_CAPSLOCK {
-		if ev.Value == 1 {
-			c.caps = !c.caps
-		}
 		return Result{}
 	}
 
 	// The toggle shortcut works even while disabled.
 	if ev.Value == 1 && !c.opts.Toggle.IsZero() && ev.Code == c.opts.Toggle.Code &&
-		c.ctrl == c.opts.Toggle.Ctrl && c.lalt == c.opts.Toggle.Alt &&
-		c.shift == c.opts.Toggle.Shift && c.meta == c.opts.Toggle.Meta {
+		c.modifiers.Ctrl == c.opts.Toggle.Ctrl && c.modifiers.Alt == c.opts.Toggle.Alt &&
+		c.modifiers.Shift == c.opts.Toggle.Shift && c.modifiers.Meta == c.opts.Toggle.Meta {
 		c.Invalidate()
 		return Result{Toggled: true}
 	}
@@ -299,7 +290,7 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	// A chord with Ctrl/Alt/Super is a shortcut, not text: whatever it
 	// did (paste, delete-word, switch tab...) the buffer no longer
 	// reflects the screen.
-	if c.ctrl || c.lalt || c.meta {
+	if c.modifiers.Ctrl || c.modifiers.Alt || c.modifiers.Meta {
 		c.clearWord()
 		c.suppressed = true
 		c.undo.active = false
@@ -335,7 +326,7 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	var ch rune
 	if hasChar {
 		s := kc.Normal
-		if c.shift {
+		if c.modifiers.Shift {
 			s = kc.Shifted
 		}
 		ch, _ = utf8.DecodeRuneInString(s)
@@ -347,10 +338,10 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	}
 
 	// AltGr diacritics: the user typed a Polish letter directly.
-	if c.altgr {
+	if c.modifiers.AltGr {
 		if lower, ok := keymap.AltGr[ev.Code]; ok {
 			r := lower
-			if c.shift != c.caps {
+			if c.modifiers.Shift != c.modifiers.Caps {
 				r = unicode.ToUpper(r)
 			}
 			c.appendRune(r, true)
@@ -365,14 +356,14 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 
 	if hasChar {
 		if ch >= 'a' && ch <= 'z' {
-			if c.caps != c.shift {
+			if c.modifiers.Caps != c.modifiers.Shift {
 				ch = unicode.ToUpper(ch)
 			}
 			c.appendRune(ch, true)
 			return Result{}
 		}
 		if ch >= 'A' && ch <= 'Z' {
-			if c.caps {
+			if c.modifiers.Caps {
 				ch = unicode.ToLower(ch)
 			}
 			c.appendRune(ch, true)
@@ -477,7 +468,7 @@ func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
 	if c.opts.Undo {
 		undo = undoState{active: true, typed: typed, emitted: cased, outRunes: utf8.RuneCountInString(cased)}
 	}
-	if c.shift || c.altgr {
+	if c.modifiers.Shift || c.modifiers.AltGr {
 		// Shift/AltGr is physically held (shifted separator, or a fast
 		// typist still holding AltGr): compositors merge modifier state
 		// across keyboards, so typing now would garble the output. Defer

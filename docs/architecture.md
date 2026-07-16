@@ -76,9 +76,12 @@ events.
 
 ```
 evdev readers (1 goroutine per keyboard)
-        │  KeyEvent{code,value}
+        │  KeyEvent{device,code,value}
         ▼
    buffered channel (cap 64)
+        ▼
+ per-device modifier/Caps aggregator
+        │  effective modifier snapshot
         ▼
  main select loop ── expander.HandleEvent   (existing text expansion)
         │
@@ -95,9 +98,9 @@ evdev readers (1 goroutine per keyboard)
   is a binary search over an in-memory index (sub-microsecond).
 - Corrections are executed on the main loop goroutine, so they are naturally
   serialized; reader goroutines never block on them (the channel buffers).
-  After a correction the loop pauses 5 ms and drains the channel, the same
-  mechanism the expander already used, so our own key echo cannot re-enter
-  the pipeline. Additionally the daemon's uinput device is never monitored.
+  The daemon's uinput device is never monitored, so queued events can only
+  come from physical keyboards and are processed normally after injected
+  output instead of being discarded.
 - If the expander fires, the corrector's buffer is invalidated (and vice
   versa) so the two subsystems cannot both rewrite the same text.
 
@@ -186,9 +189,11 @@ The case pattern of the typed token is detected and re-applied to the
 - all-upper, length ≥ 2 → upper (`ZOLW→ŻÓŁW`)
 - any other mixed pattern → **skip correction** (deterministic, tested)
 
-Caps Lock is tracked (initial state read from the keyboard LED at startup
-and on hotplug; toggled on key-down), so `ZOLW` typed with Caps Lock also
-uppercases correctly.
+Caps Lock and held modifiers are aggregated per evdev device (initial Caps
+state is read from the keyboard LED at startup and on hotplug). Releasing one
+Shift does not clear another Shift still held on the same or another keyboard.
+The uinput backend compensates for active Caps Lock when choosing whether to
+emit Shift, so `ZOLW` typed with Caps Lock also outputs uppercase correctly.
 
 ## Output strategy
 
@@ -273,7 +278,8 @@ notification via `org.freedesktop.Notifications`.
   off. Layout switching is not auto-detected (evdev has no layout notion).
 - Correction fires on `.` also inside things like file names typed in a
   GUI field (`zolw.txt` → `żółw.txt`) — mitigated by exclusions and undo.
-- Multiple keyboards share one word buffer (same as the expander); typing
-  one word on two keyboards simultaneously is out of scope.
+- Multiple keyboards share one word buffer (same as the expander), but their
+  held modifiers are tracked independently. Typing one word on two keyboards
+  simultaneously is still out of scope.
 - Initial Caps Lock state is read from the LED; exotic keyboards without a
   Caps Lock LED start assumed-off until first press.

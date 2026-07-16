@@ -4,13 +4,17 @@ import (
 	"fmt"
 
 	evdev "github.com/holoplot/go-evdev"
+
+	"github.com/andresousadotpt/texpand/internal/inputstate"
 )
 
 // KeyEvent carries a key code and value (1=press, 0=release, 2=repeat)
 // from a keyboard monitoring goroutine.
 type KeyEvent struct {
-	Code  evdev.EvCode
-	Value int32
+	Device    string
+	Code      evdev.EvCode
+	Value     int32
+	Modifiers inputstate.Modifiers
 }
 
 // isMonitorableKeyboard decides whether a device with the given name and
@@ -160,7 +164,7 @@ func MonitorKeyboard(dev *evdev.InputDevice, ch chan<- KeyEvent, done chan<- key
 			return
 		}
 		if ev.Type == evdev.EV_KEY {
-			ch <- KeyEvent{Code: ev.Code, Value: ev.Value}
+			ch <- KeyEvent{Device: path, Code: ev.Code, Value: ev.Value}
 		}
 	}
 }

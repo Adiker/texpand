@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/bendahl/uinput"
@@ -73,7 +74,8 @@ type Edit struct {
 // for Polish diacritics. Fails with ErrUnmappable (before emitting
 // anything) if any rune has no key sequence.
 type Uinput struct {
-	Kbd Keyboard
+	Kbd      Keyboard
+	CapsLock func() bool
 }
 
 func (u *Uinput) Name() string { return "uinput" }
@@ -100,14 +102,18 @@ func (u *Uinput) Type(text string) error {
 	}
 	for _, r := range text {
 		rk := keymap.Reverse[r]
-		if rk.Shift {
+		shift := rk.Shift
+		if u.CapsLock != nil && u.CapsLock() && unicode.IsLetter(r) {
+			shift = !shift
+		}
+		if shift {
 			if err := u.Kbd.KeyDown(uinput.KeyLeftshift); err != nil {
 				return fail(fmt.Errorf("shift down: %w", err))
 			}
 		}
 		if rk.AltGr {
 			if err := u.Kbd.KeyDown(uinput.KeyRightalt); err != nil {
-				if rk.Shift {
+				if shift {
 					_ = u.Kbd.KeyUp(uinput.KeyLeftshift)
 				}
 				return fail(fmt.Errorf("altgr down: %w", err))
@@ -121,20 +127,20 @@ func (u *Uinput) Type(text string) error {
 			if rk.AltGr {
 				_ = u.Kbd.KeyUp(uinput.KeyRightalt)
 			}
-			if rk.Shift {
+			if shift {
 				_ = u.Kbd.KeyUp(uinput.KeyLeftshift)
 			}
 			return fail(fmt.Errorf("key %d: %w", rk.Code, err))
 		}
 		if rk.AltGr {
 			if err := u.Kbd.KeyUp(uinput.KeyRightalt); err != nil {
-				if rk.Shift {
+				if shift {
 					_ = u.Kbd.KeyUp(uinput.KeyLeftshift)
 				}
 				return fmt.Errorf("%w: altgr up: %v", ErrOutputMayBePartial, err)
 			}
 		}
-		if rk.Shift {
+		if shift {
 			if err := u.Kbd.KeyUp(uinput.KeyLeftshift); err != nil {
 				return fmt.Errorf("%w: shift up: %v", ErrOutputMayBePartial, err)
 			}
@@ -311,6 +317,7 @@ type Writer struct {
 	Kbd      Keyboard
 	Backends []Backend
 	Debug    func(format string, args ...any)
+	CapsLock func() bool
 }
 
 // Apply validates and selects a backend before deleting anything, then
@@ -382,7 +389,7 @@ func (w *Writer) withRestore(operationErr error, restore string) error {
 	if restore == "" {
 		return operationErr
 	}
-	recovery := &Uinput{Kbd: w.Kbd}
+	recovery := &Uinput{Kbd: w.Kbd, CapsLock: w.CapsLock}
 	if err := recovery.Type(restore); err != nil {
 		return errors.Join(operationErr, fmt.Errorf("restore %q: %w", restore, err))
 	}
