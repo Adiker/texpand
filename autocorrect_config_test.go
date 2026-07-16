@@ -81,6 +81,22 @@ excluded_apps: [myterm]
 	}
 }
 
+// The config file shipped by `texpand init` must parse and normalize to
+// the documented defaults.
+func TestShippedDefaultConfigValid(t *testing.T) {
+	var cfg AppConfig
+	if err := yaml.Unmarshal(defaultAppConfig, &cfg); err != nil {
+		t.Fatalf("defaults/config.yml does not parse: %v", err)
+	}
+	s, err := cfg.Autocorrect.Normalized()
+	if err != nil {
+		t.Fatalf("defaults/config.yml invalid: %v", err)
+	}
+	if !s.Enabled || !s.OnSpace || s.OnEnter || s.OnTab || !s.Undo || s.AllowClipboardFallback {
+		t.Errorf("shipped defaults diverge from documented behaviour: %+v", s)
+	}
+}
+
 func TestAutocorrectValidation(t *testing.T) {
 	cases := []struct {
 		name string

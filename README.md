@@ -1,8 +1,8 @@
 # texpand
 
-Lightweight Wayland text expander. Reads raw keyboard events via `evdev`, types replacements directly via `uinput`. Works on any Wayland compositor (KDE, GNOME, Hyprland, Sway, etc.).
+Lightweight Wayland text expander **with system-wide Polish diacritics autocorrection** (`zolw ` → `żółw `). Reads raw keyboard events via `evdev`, types replacements directly via `uinput`. Works on any Wayland compositor (KDE, GNOME, Hyprland, Sway, etc.); the autocorrection targets KDE Plasma Wayland with the Polish (Programmer) layout.
 
-Single static binary. YAML config (espanso-compatible format). Zero runtime dependencies (optional: `wtype` for Unicode, `wl-clipboard` as last-resort fallback).
+Single static binary. YAML config (espanso-compatible format). Zero runtime dependencies (optional: `hunspell-pl` for autocorrection, `wtype` for Unicode, `wl-clipboard` as last-resort fallback).
 
 > **Warning**: This was vibe coded. It works, but don't expect anything from it xD.
 
@@ -28,7 +28,104 @@ Two trigger modes (set globally in `config.yml`):
 
 Config changes are picked up automatically — no restart needed.
 
+## Polish autocorrection
+
+Typing Polish without reaching for AltGr: finish a word without diacritics
+and texpand fixes it the moment you hit a word boundary. Ordinary typing
+stays latency-free — the per-keystroke path is an in-memory buffer update
+(~20 ns, zero allocations, no dictionary access); the dictionary is only
+consulted when Space/punctuation commits a word (~0.0001 ms per lookup).
+
+```
+zolw␣    → żółw␣          Zolw.    → Żółw.
+zrodlo,  → źródło,        WLASNIE! → WŁAŚNIE!
+pisze␣   → pisze␣         (valid word, "piszę" also exists → left alone)
+laska␣   → laska␣         (ambiguous with "łaska" → left alone)
+```
+
+**Safe mode** (the only mode in v1) corrects a word only when *all* of:
+it contains no diacritics and only letters; it is **not** itself a valid
+Polish word; the ASCII-folded dictionary lookup yields **exactly one**
+candidate; and the case pattern is lower/Title/UPPER (mixed case is
+skipped). Hyphenated compounds (`bialo-czerwony`), contractions,
+identifiers, paths and e-mails are never touched.
+
+- **Undo**: press Backspace right after a correction to get your original
+  word back (`żółw ` + Backspace → `zolw`). Anything else commits it.
+- **Toggle**: `ctrl+alt+slash` (configurable), or
+  `texpand autocorrect enable|disable|toggle|status`.
+- **Boundaries**: Space, `. , ! ? : ;` and `) ] } "` by default. Enter and
+  Tab commit the word but do **not** correct by default — Enter often
+  submits a chat message or form and Tab moves focus, so rewriting after
+  the fact could edit the wrong widget. Opt in with
+  `correct_on: {enter: true, tab: true}`.
+- **App exclusions**: no corrections in terminals, IDEs/code editors, or
+  remote-desktop apps by default (configurable, `*` globs supported). On
+  KDE Plasma the active app is tracked via a tiny KWin script loaded at
+  runtime; if detection is unavailable, `on_unknown_app` decides
+  (default: correct).
+- **Dictionary**: the system Hunspell Polish dictionary
+  (`pacman -S hunspell-pl`, i.e. `/usr/share/hunspell/pl_PL.dic`). It is
+  expanded to ~2.2 M inflected forms at first start (~3.5 s, in the
+  background — typing is never blocked) and cached in
+  `~/.cache/texpand/pl-index.cache` (validated against the dictionary
+  path/size/mtime; delete it any time).
+- **Output**: Polish characters are typed directly through uinput AltGr
+  combinations (Polish Programmer layout) — no subprocess and no
+  clipboard involved. `wtype` is the fallback; clipboard paste exists but
+  is off unless you set `allow_clipboard_fallback: true`.
+
+See `docs/architecture.md` for the full design and the documented edge
+cases; configuration reference is in the `autocorrect:` section of
+[defaults/config.yml](defaults/config.yml).
+
+### Performance
+
+Reproduce with (requires `hunspell-pl` for the real-dictionary numbers):
+
+```bash
+go test -bench . -benchtime 2s ./internal/correct/ ./internal/dict/
+```
+
+Measured on a desktop Ryzen (go 1.26, real `pl_PL` dictionary, 2.2 M word
+forms + 2.2 M candidate pairs):
+
+```
+BenchmarkOrdinaryKey              20.5 ns/op    0 B/op   0 allocs/op
+BenchmarkWordCommit              239 ns/op     40 B/op   3 allocs/op
+BenchmarkLookupUniqueCandidate    85.3 ns/op    0 B/op   0 allocs/op
+BenchmarkLookupAmbiguous          88.9 ns/op    0 B/op   0 allocs/op
+BenchmarkLookupMiss               83.1 ns/op    0 B/op   0 allocs/op
+BenchmarkIsWord                   79.9 ns/op    0 B/op   0 allocs/op
+BenchmarkFullBoundaryDecision    131 ns/op      0 B/op   0 allocs/op
+BenchmarkBuildRealDictionary    3.41 s/op                (once, cached)
+```
+
+Ordinary keystrokes never touch the dictionary or the disk; the full
+word-boundary decision against the real dictionary is ~0.13 µs — about
+four orders of magnitude below the 1 ms perceptibility budget.
+
 ## Install
+
+### Arch Linux / EndeavourOS (package)
+
+```bash
+sudo pacman -S --needed hunspell-pl go base-devel
+git clone https://github.com/andresousadotpt/texpand && cd texpand/packaging
+makepkg -si
+texpand init
+systemctl --user enable --now texpand.service
+```
+
+The package installs the binary, the systemd user unit, a udev rule for
+`/dev/uinput` and a modules-load entry. You still need to be in the
+`input` group (see below) and to re-login once.
+
+To uninstall: `sudo pacman -R texpand`, then optionally remove
+`~/.config/texpand`, `~/.cache/texpand`, and take yourself out of the
+`input` group (`sudo gpasswd -d $USER input`).
+
+### go install (manual)
 
 ```bash
 go install github.com/andresousadotpt/texpand@latest
@@ -215,15 +312,19 @@ matches:
 ### Usage
 
 ```
-texpand [--debug] [init|version|migrate]
+texpand [--debug|--debug-unsafe] [init|version|migrate|autocorrect <cmd>]
 ```
 
-| Command   | Description                                          |
-| --------- | ---------------------------------------------------- |
-| (none)    | Run texpand (monitor keyboards, expand triggers)     |
-| `init`    | Create default config in `~/.config/texpand/`        |
-| `version` | Print version                                        |
-| `migrate` | Migrate config files to the latest format            |
+| Command               | Description                                                |
+| --------------------- | ---------------------------------------------------------- |
+| (none)                | Run texpand (monitor keyboards, expand, autocorrect)       |
+| `init`                | Create default config in `~/.config/texpand/`              |
+| `version`             | Print version                                              |
+| `migrate`             | Migrate config files to the latest format                  |
+| `autocorrect enable`  | Turn autocorrection on in the running daemon (via DBus)    |
+| `autocorrect disable` | Turn autocorrection off                                    |
+| `autocorrect toggle`  | Flip autocorrection                                        |
+| `autocorrect status`  | Show enabled state, dictionary stats and active app        |
 
 | Trigger  | Example output                              |
 | -------- | ------------------------------------------- |
@@ -273,7 +374,7 @@ texpand: monitoring 2 keyboard(s) — 35 triggers loaded
 
 ### Debug mode
 
-Use `--debug` (or `-d`) for verbose output on stderr — shows config loading, trigger mode, loaded triggers, buffer state, and match decisions:
+Use `--debug` (or `-d`) for verbose output on stderr — shows config loading, trigger mode, loaded triggers, and match decisions. **`--debug` never prints the words you type.** If you need to trace buffer contents while diagnosing a correction, use `--debug-unsafe` and treat the output as sensitive:
 
 ```bash
 ./texpand --debug
@@ -380,6 +481,74 @@ systemctl --user restart texpand.service
 ### Wrong characters
 
 The keymap assumes US/International layout. Letters and numbers work across layouts, but symbol keys (`]`, `}`, `~`, `'`) may differ.
+
+### Autocorrection never fires
+
+```bash
+texpand autocorrect status       # enabled? dictionary loaded?
+pacman -Q hunspell-pl            # dictionary installed?
+journalctl --user -u texpand.service | grep -i -E "dictionary|autocorrect"
+```
+
+Common causes: dictionary still loading (first start takes a few seconds,
+then it's cached), autocorrect toggled off (`ctrl+alt+slash` flips it),
+the focused app is on the exclusion list (`autocorrect status` shows the
+detected app), or the word is ambiguous/already valid — safe mode only
+corrects unambiguous words.
+
+### Corrections come out with wrong characters (e.g. `¿` or plain ASCII)
+
+The uinput backend assumes your active layout is **Polish (Programmer)**
+(`ż` = AltGr+Z etc.). On any other layout set `output: wtype` in the
+`autocorrect:` config section (requires `pacman -S wtype`), or disable
+autocorrection.
+
+### App exclusions don't work / status shows "(unknown)" app
+
+Active-window tracking needs KDE Plasma (KWin scripting over DBus). Check
+`journalctl --user -u texpand.service` for "active-window detection
+unavailable". On other compositors exclusions degrade to the
+`on_unknown_app` policy — set it to `skip` if you'd rather have no
+corrections than corrections in the wrong window.
+
+### Dictionary cache issues
+
+The cache self-invalidates when the dictionary changes; to force a rebuild:
+
+```bash
+rm ~/.cache/texpand/pl-index.cache
+systemctl --user restart texpand.service
+```
+
+## Security & privacy
+
+texpand reads raw keyboard events, so treat it like the security-sensitive
+software it is:
+
+- **Fully local.** No network access, no analytics, no cloud calls — the
+  binary contains no networking code. The dictionary comes from your
+  installed `hunspell-pl` package.
+- **Nothing you type is stored.** The word buffer is a few dozen bytes of
+  RAM, overwritten as you type. The dictionary cache is derived from the
+  public dictionary only. `--debug` never logs typed words; only the
+  clearly named `--debug-unsafe` flag can.
+- **`input` group membership is a real trade-off.** Being in `input`
+  means *every* process running as your user could read all keyboards,
+  not just texpand. That is how non-root evdev access works on Linux
+  today. `systemd-logind`'s `TakeDevice` API was evaluated as an
+  alternative, but logind only grants devices to the session controller
+  (your compositor), so a background service can't use it — see
+  `docs/architecture.md`. Keep your user account clean and review what
+  you run.
+- **The udev rule is minimal**: it only sets group `input`, mode `0660`
+  on `/dev/uinput`. The daemon never runs as root.
+- **Clipboard fallback is off by default** because it would place
+  corrected text (and briefly, your previous clipboard) into the Wayland
+  clipboard, which is visible to other apps and fragile in password
+  fields and remote sessions.
+- **Password fields are not detected** — no Wayland API exposes that
+  safely. Rely on the app exclusion list; password managers' windows can
+  be added to `excluded_apps`.
 
 ## License
 

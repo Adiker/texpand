@@ -5,3 +5,31 @@ config_version: 1
 #   "space"     - triggers fire when space is pressed after the trigger (default)
 #   "immediate" - triggers fire as soon as the trigger is typed
 trigger_mode: space
+
+# Polish diacritics autocorrection (zolw -> żółw). Requires a Polish
+# Hunspell dictionary (Arch: pacman -S hunspell-pl). All keys are
+# optional; the values below are the defaults.
+autocorrect:
+  enabled: true
+  mode: safe            # only correct unambiguous, out-of-dictionary words
+  dictionary: auto      # or an explicit path to a pl_PL.dic
+  min_word_length: 2
+  correct_on:
+    space: true
+    punctuation: true   # . , ! ? : ;
+    closers: true       # ) ] } "
+    enter: false        # off: Enter often submits (chat, forms)
+    tab: false          # off: Tab often moves focus
+  undo: true            # Backspace right after a correction restores the word
+  toggle_shortcut: ctrl+alt+slash
+  notify_on_toggle: true
+  output: auto          # auto (uinput, then wtype) | uinput | wtype
+  allow_clipboard_fallback: false
+  cache: true           # cache the parsed dictionary in ~/.cache/texpand
+  on_unknown_app: correct  # or: skip (never correct when the app is unknown)
+  # excluded_apps: uncomment to override the built-in list (terminals,
+  # IDEs, remote desktop). Case-insensitive, * globs allowed.
+  # excluded_apps:
+  #   - org.kde.konsole
+  #   - kitty
+  #   - jetbrains-*

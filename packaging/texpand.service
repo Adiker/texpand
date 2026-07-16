@@ -1,0 +1,20 @@
+[Unit]
+Description=texpand - Wayland text expander with Polish autocorrection
+# The daemon retries device initialization itself for ~30s, so no hard
+# dependency on udev settling is needed.
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/texpand
+Restart=on-failure
+RestartSec=5
+# Ensure wl-copy/wl-paste and DBus can reach the session
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+# Hardening. NoNewPrivileges is safe; stricter sandboxing (ProtectHome,
+# PrivateDevices) would break /dev/input and /dev/uinput access or config
+# hot-reload, so it is deliberately not applied.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
