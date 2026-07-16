@@ -38,7 +38,7 @@ func NewExpander(cfg *Config, vkbd output.Keyboard) *Expander {
 	if wt.Available() {
 		backends = append(backends, wt)
 	}
-	backends = append(backends, &output.Clipboard{Kbd: vkbd})
+	backends = append(backends, &output.Clipboard{Kbd: vkbd, Report: reportOutputError})
 	writer := &output.Writer{Kbd: vkbd, Backends: backends, Debug: dbg}
 	return &Expander{config: cfg, vkbd: vkbd, writer: writer, maxLen: maxLen}
 }
@@ -80,14 +80,19 @@ func (e *Expander) performExpansion(m Match, extraBackspaces int) {
 	}
 
 	backspaces := utf8.RuneCountInString(m.Trigger) + extraBackspaces
-	if err := e.writer.Apply(backspaces, replacement); err != nil {
+	restore := m.Trigger + strings.Repeat(" ", extraBackspaces)
+	if err := e.writer.Apply(output.Edit{Backspaces: backspaces, Text: replacement, Restore: restore}); err != nil {
 		dbg("expansion output failed: %v", err)
+		return
 	}
 
 	// Move cursor back if $|$ was present
 	if cursorOffset > 0 {
 		for i := 0; i < cursorOffset; i++ {
-			e.vkbd.KeyPress(uinput.KeyLeft)
+			if err := e.vkbd.KeyPress(uinput.KeyLeft); err != nil {
+				dbg("cursor positioning failed: %v", err)
+				return
+			}
 		}
 	}
 }
