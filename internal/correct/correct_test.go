@@ -327,6 +327,22 @@ func TestShiftedSeparatorDefersUntilShiftRelease(t *testing.T) {
 	}
 }
 
+func TestAltGrHeldDefersCorrection(t *testing.T) {
+	// Fast typist: AltGr from the last diacritic is still held when Space
+	// lands. The plan must wait for the AltGr release.
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	d.send(evdev.KEY_RIGHTALT, 1)
+	if r := d.send(evdev.KEY_SPACE, 1); r.Plan != nil {
+		t.Fatal("plan emitted while AltGr held")
+	}
+	d.send(evdev.KEY_SPACE, 0)
+	r := d.send(evdev.KEY_RIGHTALT, 0)
+	if r.Plan == nil || r.Plan.Type != "żółw " {
+		t.Fatalf("plan on AltGr release = %+v", r.Plan)
+	}
+}
+
 func TestPendingPlanCancelledByNextKey(t *testing.T) {
 	// User keeps Shift held and types more: the deferred correction must
 	// be dropped, not applied to text that moved on.

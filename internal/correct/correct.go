@@ -204,6 +204,18 @@ func (c *Corrector) clearWord() {
 	c.overflow = false
 }
 
+// maybeReleasePending emits a deferred correction once no output-altering
+// modifier (Shift, AltGr) is physically held anymore.
+func (c *Corrector) maybeReleasePending() Result {
+	if c.pending == nil || c.shift || c.altgr {
+		return Result{}
+	}
+	plan := c.pending
+	c.pending = nil
+	c.undo = c.pendingUndo
+	return Result{Plan: plan}
+}
+
 // separator returns the committed separator rune and whether correction
 // is enabled for it, for a key that ends a word. ok is false when the key
 // is not a word boundary.
@@ -235,13 +247,7 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	switch ev.Code {
 	case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
 		c.shift = ev.Value > 0
-		if !c.shift && c.pending != nil {
-			plan := c.pending
-			c.pending = nil
-			c.undo = c.pendingUndo
-			return Result{Plan: plan}
-		}
-		return Result{}
+		return c.maybeReleasePending()
 	case evdev.KEY_LEFTCTRL, evdev.KEY_RIGHTCTRL:
 		c.ctrl = ev.Value > 0
 		return Result{}
@@ -250,7 +256,7 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		return Result{}
 	case evdev.KEY_RIGHTALT: // AltGr on the Polish Programmer layout
 		c.altgr = ev.Value > 0
-		return Result{}
+		return c.maybeReleasePending()
 	case evdev.KEY_LEFTMETA, evdev.KEY_RIGHTMETA:
 		c.meta = ev.Value > 0
 		return Result{}
@@ -468,9 +474,11 @@ func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
 	if c.opts.Undo {
 		undo = undoState{active: true, typed: typed, outRunes: utf8.RuneCountInString(cased)}
 	}
-	if c.shift {
-		// Shift is physically held (shifted separator): typing now would
-		// come out uppercase. Defer until Shift is released.
+	if c.shift || c.altgr {
+		// Shift/AltGr is physically held (shifted separator, or a fast
+		// typist still holding AltGr): compositors merge modifier state
+		// across keyboards, so typing now would garble the output. Defer
+		// until the modifier is released.
 		c.pending = plan
 		c.pendingUndo = undo
 		return Result{}
