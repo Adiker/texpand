@@ -125,9 +125,13 @@ evdev readers (1 goroutine per keyboard)
    avoids Go map overhead. The index is immutable after build and safe for
    concurrent readers.
 
-Loading runs **once, in a background goroutine at startup**; until it
-finishes, the corrector simply produces no corrections. The key-event path
-never touches the dictionary files.
+Loading runs in a background goroutine; until it finishes, the corrector
+simply produces no corrections. Each load carries a generation number. A
+hot-reloaded `dictionary` path or `cache` setting starts a new generation and
+detaches the old index; late results from superseded generations are ignored.
+Failures are exposed as `failed` through runtime status, and enabling
+autocorrection again retries a failed load. The key-event path never touches
+the dictionary files.
 
 An optional cache (`~/.cache/texpand/pl-index.cache`, config `cache: true`)
 stores the finished index; it is validated against the absolute paths,

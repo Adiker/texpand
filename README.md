@@ -70,6 +70,9 @@ identifiers, paths and e-mails are never touched.
   background — typing is never blocked) and cached in
   `~/.cache/texpand/pl-index.cache` (validated against the dictionary
   path/size/mtime; delete it any time).
+  Changing `dictionary` or `cache` hot-reloads the index. A failed load is
+  reported by `texpand autocorrect status`; run `texpand autocorrect enable`
+  after fixing the cause to retry without restarting the daemon.
 - **Output**: Polish characters are typed directly through uinput AltGr
   combinations (Polish Programmer layout) — no subprocess and no
   clipboard involved. `wtype` is the fallback; clipboard paste exists but
@@ -324,7 +327,7 @@ texpand [--debug|--debug-unsafe] [init|version|migrate|autocorrect <cmd>]
 | `autocorrect enable`  | Turn autocorrection on in the running daemon (via DBus)    |
 | `autocorrect disable` | Turn autocorrection off                                    |
 | `autocorrect toggle`  | Flip autocorrection                                        |
-| `autocorrect status`  | Show enabled state, dictionary stats and active app        |
+| `autocorrect status`  | Show enabled state, dictionary lifecycle/error and active app |
 
 | Trigger  | Example output                              |
 | -------- | ------------------------------------------- |
@@ -494,7 +497,9 @@ Common causes: dictionary still loading (first start takes a few seconds,
 then it's cached), autocorrect toggled off (`ctrl+alt+slash` flips it),
 the focused app is on the exclusion list (`autocorrect status` shows the
 detected app), or the word is ambiguous/already valid — safe mode only
-corrects unambiguous words.
+corrects unambiguous words. If status reports `dictionary: failed (...)`, fix
+the reported path/package problem and run `texpand autocorrect enable` to
+retry immediately.
 
 ### Corrections come out with wrong characters (e.g. `¿` or plain ASCII)
 

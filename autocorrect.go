@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync/atomic"
@@ -11,6 +12,31 @@ import (
 	"github.com/andresousadotpt/texpand/internal/dict"
 	"github.com/andresousadotpt/texpand/internal/output"
 )
+
+const (
+	dictionaryIdle    = "idle"
+	dictionaryLoading = "loading"
+	dictionaryReady   = "ready"
+	dictionaryFailed  = "failed"
+)
+
+type dictionaryStatus struct {
+	State string
+	Error string
+}
+
+type dictionaryLoadKey struct {
+	Path  string
+	Cache bool
+}
+
+type dictionaryLoadResult struct {
+	Generation uint64
+	Index      *dict.Index
+	Err        error
+}
+
+type dictionaryLoader func(AutocorrectSettings) (*dict.Index, error)
 
 // autocorrect bundles the Polish autocorrection subsystem: the state
 // machine, output writer, app exclusion, dictionary loading and the DBus
@@ -25,10 +51,16 @@ type autocorrect struct {
 	server    *control.Server
 	kwinStop  func()
 
-	index       atomic.Pointer[dict.Index]
-	dictCh      chan *dict.Index // loader → main loop
-	loadReq     chan struct{}    // control goroutine → main loop
-	loadStarted bool
+	index      atomic.Pointer[dict.Index]
+	dictStatus atomic.Value // dictionaryStatus; read by DBus goroutine
+	dictCh     chan dictionaryLoadResult
+	loadReq    chan struct{} // control goroutine → main loop
+	loader     dictionaryLoader
+
+	// The fields below are confined to the main event-loop goroutine.
+	loadGeneration uint64
+	loadKey        dictionaryLoadKey
+	hasLoadKey     bool
 
 	// notifyOnToggle is read from the DBus goroutine while the main loop
 	// may hot-reload settings, hence atomic.
@@ -42,9 +74,11 @@ func newAutocorrect(settings AutocorrectSettings, vkbd output.Keyboard, capsLock
 	ac := &autocorrect{
 		settings: settings,
 		tracker:  &appfilter.Tracker{},
-		dictCh:   make(chan *dict.Index, 1),
+		dictCh:   make(chan dictionaryLoadResult, 8),
 		loadReq:  make(chan struct{}, 1),
+		loader:   loadIndex,
 	}
+	ac.dictStatus.Store(dictionaryStatus{State: dictionaryIdle})
 	ac.excluder = appfilter.NewExcluder(ac.tracker, settings.ExcludedApps, settings.CorrectOnUnknownApp)
 	ac.corrector = correct.New(ac.correctorOptions(settings))
 	ac.corrector.SetEnabled(settings.Enabled)
@@ -121,23 +155,79 @@ func (ac *autocorrect) shutdown() {
 	}
 }
 
-// maybeStartDictLoad launches the background dictionary load once. Runs on
-// the main loop goroutine.
+func loadKeyFor(s AutocorrectSettings) dictionaryLoadKey {
+	return dictionaryLoadKey{Path: s.Dictionary, Cache: s.Cache}
+}
+
+func (ac *autocorrect) dictionaryStatus() dictionaryStatus {
+	return ac.dictStatus.Load().(dictionaryStatus)
+}
+
+func (ac *autocorrect) setDictionaryStatus(state, errText string) {
+	ac.dictStatus.Store(dictionaryStatus{State: state, Error: errText})
+}
+
+// maybeStartDictLoad starts or retries the desired dictionary unless the same
+// configuration is already loading or ready. Runs on the main loop goroutine.
 func (ac *autocorrect) maybeStartDictLoad() {
-	if ac.loadStarted {
+	key := loadKeyFor(ac.settings)
+	status := ac.dictionaryStatus()
+	if ac.hasLoadKey && ac.loadKey == key &&
+		(status.State == dictionaryLoading || status.State == dictionaryReady) {
 		return
 	}
-	ac.loadStarted = true
+	ac.startDictLoad(key)
+}
+
+func (ac *autocorrect) startDictLoad(key dictionaryLoadKey) {
+	ac.loadGeneration++
+	generation := ac.loadGeneration
+	ac.loadKey = key
+	ac.hasLoadKey = true
+	ac.setDictionaryStatus(dictionaryLoading, "")
+	ac.index.Store(nil)
+	ac.corrector.SetLookup(nil)
 	settings := ac.settings
+	loader := ac.loader
 	go func() {
-		ix, err := loadIndex(settings)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "texpand: autocorrect disabled: %v\n", err)
-			return
-		}
-		ac.index.Store(ix)
-		ac.dictCh <- ix
+		ix, err := loader(settings)
+		ac.dictCh <- dictionaryLoadResult{Generation: generation, Index: ix, Err: err}
 	}()
+}
+
+// invalidateDictionary cancels the current generation logically. An in-flight
+// loader may finish, but its result will be ignored.
+func (ac *autocorrect) invalidateDictionary() {
+	ac.loadGeneration++
+	ac.hasLoadKey = false
+	ac.setDictionaryStatus(dictionaryIdle, "")
+	ac.index.Store(nil)
+	ac.corrector.SetLookup(nil)
+}
+
+// handleDictLoadResult applies a loader result if it belongs to the current
+// generation. Returns true when the result was current.
+func (ac *autocorrect) handleDictLoadResult(result dictionaryLoadResult) bool {
+	if result.Generation != ac.loadGeneration {
+		dbg("ignoring stale dictionary load generation %d (current %d)", result.Generation, ac.loadGeneration)
+		return false
+	}
+	if result.Err == nil && result.Index == nil {
+		result.Err = errors.New("dictionary loader returned no index")
+	}
+	if result.Err != nil {
+		ac.index.Store(nil)
+		ac.corrector.SetLookup(nil)
+		ac.setDictionaryStatus(dictionaryFailed, result.Err.Error())
+		fmt.Fprintf(os.Stderr, "texpand: autocorrect dictionary failed: %v\n", result.Err)
+		return true
+	}
+	ac.index.Store(result.Index)
+	ac.corrector.SetLookup(result.Index)
+	ac.setDictionaryStatus(dictionaryReady, "")
+	words, cands := result.Index.Stats()
+	fmt.Printf("texpand: Polish dictionary ready — %d word forms, %d correction candidates\n", words, cands)
+	return true
 }
 
 // loadIndex loads the dictionary index from cache if valid, else builds it
@@ -172,6 +262,7 @@ func loadIndex(s AutocorrectSettings) (*dict.Index, error) {
 // loop goroutine.
 func (ac *autocorrect) applySettings(s AutocorrectSettings, vkbd output.Keyboard, capsLock func() bool) {
 	oldEnabled := ac.settings.Enabled
+	dictionaryChanged := loadKeyFor(ac.settings) != loadKeyFor(s)
 	ac.settings = s
 	ac.notifyOnToggle.Store(s.NotifyOnToggle)
 	ac.excluder.Configure(s.ExcludedApps, s.CorrectOnUnknownApp)
@@ -180,7 +271,13 @@ func (ac *autocorrect) applySettings(s AutocorrectSettings, vkbd output.Keyboard
 	if s.Enabled != oldEnabled {
 		ac.corrector.SetEnabled(s.Enabled)
 	}
-	if ac.corrector.Enabled() {
+	if dictionaryChanged {
+		if ac.corrector.Enabled() {
+			ac.startDictLoad(loadKeyFor(s))
+		} else {
+			ac.invalidateDictionary()
+		}
+	} else if ac.corrector.Enabled() {
 		ac.maybeStartDictLoad()
 	}
 }
@@ -221,8 +318,13 @@ func (ac *autocorrect) SetAutocorrectEnabled(v bool) {
 }
 
 func (ac *autocorrect) AutocorrectStatus() control.Status {
-	st := control.Status{Enabled: ac.corrector.Enabled()}
-	if ix := ac.index.Load(); ix != nil {
+	dictStatus := ac.dictionaryStatus()
+	st := control.Status{
+		Enabled:   ac.corrector.Enabled(),
+		DictState: dictStatus.State,
+		DictError: dictStatus.Error,
+	}
+	if ix := ac.index.Load(); ix != nil && dictStatus.State == dictionaryReady {
 		st.DictReady = true
 		words, cands := ix.Stats()
 		st.Words = uint32(words)

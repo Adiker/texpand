@@ -6,6 +6,7 @@
 package control
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/godbus/dbus/v5"
@@ -26,6 +27,8 @@ type Status struct {
 	Words      uint32
 	Candidates uint32
 	ActiveApp  string
+	DictState  string
+	DictError  string
 }
 
 // Daemon is what the DBus server needs from the running daemon. All
@@ -60,6 +63,13 @@ func (h *handler) Toggle() (bool, *dbus.Error) {
 func (h *handler) Status() (bool, bool, uint32, uint32, string, *dbus.Error) {
 	st := h.d.AutocorrectStatus()
 	return st.Enabled, st.DictReady, st.Words, st.Candidates, st.ActiveApp, nil
+}
+
+// StatusDetails extends Status without changing its existing D-Bus signature,
+// so older clients remain compatible.
+func (h *handler) StatusDetails() (bool, string, uint32, uint32, string, string, *dbus.Error) {
+	st := h.d.AutocorrectStatus()
+	return st.Enabled, st.DictState, st.Words, st.Candidates, st.ActiveApp, st.DictError, nil
 }
 
 func (h *handler) SetActiveWindow(class string) *dbus.Error {
@@ -149,25 +159,48 @@ func ClientCommand(cmd string) (string, error) {
 		}
 		return "autocorrect disabled", nil
 	case "status":
-		var enabled, ready bool
-		var words, cands uint32
-		var app string
-		if err := obj.Call(Interface+".Status", 0).Store(&enabled, &ready, &words, &cands, &app); err != nil {
-			return fail(err)
+		var st Status
+		err := obj.Call(Interface+".StatusDetails", 0).Store(
+			&st.Enabled, &st.DictState, &st.Words, &st.Candidates, &st.ActiveApp, &st.DictError,
+		)
+		if err != nil {
+			var dbusErr dbus.Error
+			if !errors.As(err, &dbusErr) || dbusErr.Name != "org.freedesktop.DBus.Error.UnknownMethod" {
+				return fail(err)
+			}
+			// Compatibility with a daemon from before StatusDetails.
+			if err := obj.Call(Interface+".Status", 0).Store(
+				&st.Enabled, &st.DictReady, &st.Words, &st.Candidates, &st.ActiveApp,
+			); err != nil {
+				return fail(err)
+			}
+			st.DictState = "loading"
+			if st.DictReady {
+				st.DictState = "ready"
+			}
 		}
-		state := "disabled"
-		if enabled {
-			state = "enabled"
-		}
-		dict := "loading"
-		if ready {
-			dict = fmt.Sprintf("%d word forms, %d candidate pairs", words, cands)
-		}
-		if app == "" {
-			app = "(unknown)"
-		}
-		return fmt.Sprintf("autocorrect: %s\ndictionary:  %s\nactive app:  %s", state, dict, app), nil
+		return formatStatus(st), nil
 	default:
 		return "", fmt.Errorf("unknown autocorrect command %q (use enable|disable|toggle|status)", cmd)
 	}
+}
+
+func formatStatus(st Status) string {
+	state := "disabled"
+	if st.Enabled {
+		state = "enabled"
+	}
+	dictionary := st.DictState
+	if dictionary == "" {
+		dictionary = "idle"
+	}
+	if dictionary == "ready" {
+		dictionary = fmt.Sprintf("ready (%d word forms, %d candidate pairs)", st.Words, st.Candidates)
+	} else if dictionary == "failed" && st.DictError != "" {
+		dictionary = fmt.Sprintf("failed (%s)", st.DictError)
+	}
+	if st.ActiveApp == "" {
+		st.ActiveApp = "(unknown)"
+	}
+	return fmt.Sprintf("autocorrect: %s\ndictionary:  %s\nactive app:  %s", state, dictionary, st.ActiveApp)
 }
