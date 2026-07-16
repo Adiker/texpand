@@ -1,78 +1,46 @@
 package main
 
 import (
-	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bendahl/uinput"
 	evdev "github.com/holoplot/go-evdev"
+
+	"github.com/andresousadotpt/texpand/internal/keymap"
+	"github.com/andresousadotpt/texpand/internal/output"
 )
-
-// ReverseKey maps a character to the uinput key code needed to type it,
-// plus whether Shift must be held.
-type ReverseKey struct {
-	Code  int
-	Shift bool
-}
-
-// reverseKeyMap maps runes to their key code + shift state, built from KeyCharMap at init.
-var reverseKeyMap map[rune]ReverseKey
-
-func init() {
-	// evdev key codes are numerically identical to uinput key codes, so we
-	// can cast directly.
-	reverseKeyMap = make(map[rune]ReverseKey, len(KeyCharMap)*2)
-	for evCode, kc := range KeyCharMap {
-		code := int(evCode)
-		for _, r := range kc.Normal {
-			reverseKeyMap[r] = ReverseKey{Code: code, Shift: false}
-		}
-		for _, r := range kc.Shifted {
-			if r != []rune(kc.Normal)[0] { // avoid overwriting if Normal == Shifted (e.g. space)
-				reverseKeyMap[r] = ReverseKey{Code: code, Shift: true}
-			}
-		}
-	}
-	// Special keys not in KeyCharMap
-	reverseKeyMap['\n'] = ReverseKey{Code: uinput.KeyEnter, Shift: false}
-	reverseKeyMap['\t'] = ReverseKey{Code: uinput.KeyTab, Shift: false}
-}
-
-// hasWtype is true if the wtype binary is available on PATH.
-// Checked once at init to avoid repeated lookups.
-var hasWtype bool
-
-// wtypeBroken is set to true after the first wtype failure, so we
-// skip it on subsequent expansions and go straight to clipboard paste.
-var wtypeBroken bool
-
-func init() {
-	_, err := exec.LookPath("wtype")
-	hasWtype = err == nil
-}
 
 // Expander maintains a rolling keystroke buffer and triggers text
 // expansion when a match is detected.
 type Expander struct {
 	config *Config
-	vkbd   uinput.Keyboard
+	vkbd   output.Keyboard
+	writer *output.Writer
 	buf    string
 	shift  bool
 	maxLen int
 }
 
 // NewExpander creates an Expander with the given config and virtual keyboard.
-func NewExpander(cfg *Config, vkbd uinput.Keyboard) *Expander {
+// Replacement text goes through the output writer (uinput with wtype and
+// clipboard fallbacks, matching the pre-refactor behaviour).
+func NewExpander(cfg *Config, vkbd output.Keyboard) *Expander {
 	maxLen := 0
 	for _, m := range cfg.Matches {
 		if len(m.Trigger) > maxLen {
 			maxLen = len(m.Trigger)
 		}
 	}
-	return &Expander{config: cfg, vkbd: vkbd, maxLen: maxLen}
+	backends := []output.Backend{&output.Uinput{Kbd: vkbd}}
+	wt := &output.Wtype{}
+	if wt.Available() {
+		backends = append(backends, wt)
+	}
+	backends = append(backends, &output.Clipboard{Kbd: vkbd})
+	writer := &output.Writer{Kbd: vkbd, Backends: backends, Debug: dbg}
+	return &Expander{config: cfg, vkbd: vkbd, writer: writer, maxLen: maxLen}
 }
 
 // Reload swaps the config and recalculates maxLen. Typing session state
@@ -97,31 +65,6 @@ func (e *Expander) ResetInputState() {
 	e.shift = false
 }
 
-// canTypeDirectly returns true if every rune in text has a reverse key mapping.
-func canTypeDirectly(text string) bool {
-	for _, r := range text {
-		if _, ok := reverseKeyMap[r]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// typeText types text character-by-character via the virtual keyboard.
-// No inter-key delays — uinput events are kernel-FIFO-ordered.
-func (e *Expander) typeText(text string) {
-	for _, r := range text {
-		rk := reverseKeyMap[r]
-		if rk.Shift {
-			e.vkbd.KeyDown(uinput.KeyLeftshift)
-		}
-		e.vkbd.KeyPress(rk.Code)
-		if rk.Shift {
-			e.vkbd.KeyUp(uinput.KeyLeftshift)
-		}
-	}
-}
-
 // performExpansion handles the full expansion sequence: backspace the
 // trigger, type/paste the replacement, and position the cursor.
 // extraBackspaces is 1 in space mode (to delete the trailing space) and 0 in immediate mode.
@@ -136,21 +79,9 @@ func (e *Expander) performExpansion(m Match, extraBackspaces int) {
 		replacement = replacement[:idx] + after
 	}
 
-	e.sendBackspaces(utf8.RuneCountInString(m.Trigger) + extraBackspaces)
-
-	if canTypeDirectly(replacement) {
-		dbg("typing directly (%d chars)", utf8.RuneCountInString(replacement))
-		e.typeText(replacement)
-	} else if hasWtype && !wtypeBroken {
-		dbg("using wtype (%d chars, has unmappable runes)", utf8.RuneCountInString(replacement))
-		if err := e.wtypeText(replacement); err != nil {
-			dbg("wtype broken: %v — disabling, falling back to clipboard", err)
-			wtypeBroken = true
-			e.clipboardPaste(replacement)
-		}
-	} else {
-		dbg("clipboard paste (%d chars, unmappable runes)", utf8.RuneCountInString(replacement))
-		e.clipboardPaste(replacement)
+	backspaces := utf8.RuneCountInString(m.Trigger) + extraBackspaces
+	if err := e.writer.Apply(backspaces, replacement); err != nil {
+		dbg("expansion output failed: %v", err)
 	}
 
 	// Move cursor back if $|$ was present
@@ -177,7 +108,7 @@ func (e *Expander) HandleEvent(ev KeyEvent) bool {
 	}
 
 	// Buffer reset keys
-	if BufferResetKeys[ev.Code] {
+	if keymap.BufferResetKeys[ev.Code] {
 		e.buf = ""
 		return false
 	}
@@ -193,7 +124,7 @@ func (e *Expander) HandleEvent(ev KeyEvent) bool {
 
 	// In "space" mode: check matches on space, then clear buffer
 	if e.config.TriggerMode != "immediate" && ev.Code == evdev.KEY_SPACE {
-		dbg("space pressed, buffer=%q, checking matches", e.buf)
+		dbgUnsafe("space pressed, buffer=%q, checking matches", e.buf)
 		for _, m := range e.config.Matches {
 			if !strings.HasSuffix(e.buf, m.Trigger) {
 				continue
@@ -208,7 +139,7 @@ func (e *Expander) HandleEvent(ev KeyEvent) bool {
 	}
 
 	// Map keycode to character
-	kc, ok := KeyCharMap[ev.Code]
+	kc, ok := keymap.Chars[ev.Code]
 	if !ok {
 		return false
 	}
@@ -225,7 +156,7 @@ func (e *Expander) HandleEvent(ev KeyEvent) bool {
 
 	// In "immediate" mode: check matches after every keystroke
 	if e.config.TriggerMode == "immediate" {
-		dbg("key '%s', buffer=%q, checking matches", ch, e.buf)
+		dbgUnsafe("key %q, buffer=%q, checking matches", ch, e.buf)
 		for _, m := range e.config.Matches {
 			if !strings.HasSuffix(e.buf, m.Trigger) {
 				continue
@@ -245,48 +176,4 @@ func (e *Expander) resolveReplacement(m Match) string {
 	now := time.Now()
 	vars := ResolveVars(m.GlobalVars, m.Vars, now)
 	return expandRefs(m.Replace, vars)
-}
-
-// sendBackspaces sends n backspace key presses via the virtual keyboard.
-func (e *Expander) sendBackspaces(n int) {
-	for i := 0; i < n; i++ {
-		e.vkbd.KeyPress(uinput.KeyBackspace)
-	}
-}
-
-// wtypeText types text via the wtype Wayland tool. Handles Unicode characters
-// that can't be typed via uinput key codes. Returns error on failure.
-func (e *Expander) wtypeText(text string) error {
-	cmd := exec.Command("wtype", "--", text)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
-}
-
-// clipboardPaste copies text to clipboard via wl-copy, sends Ctrl+V to
-// paste, then restores the previous clipboard asynchronously.
-func (e *Expander) clipboardPaste(text string) {
-	// Save current clipboard
-	oldClip, _ := exec.Command("wl-paste", "-n").Output()
-
-	// Copy replacement text (.Run() blocks until complete — no extra sleep needed)
-	exec.Command("wl-copy", "--", text).Run()
-
-	// Send Ctrl+V to paste
-	e.vkbd.KeyDown(uinput.KeyLeftctrl)
-	time.Sleep(5 * time.Millisecond)
-	e.vkbd.KeyPress(uinput.KeyV)
-	time.Sleep(5 * time.Millisecond)
-	e.vkbd.KeyUp(uinput.KeyLeftctrl)
-	time.Sleep(20 * time.Millisecond)
-
-	// Restore previous clipboard asynchronously
-	if len(oldClip) > 0 {
-		go func() {
-			time.Sleep(200 * time.Millisecond)
-			exec.Command("wl-copy", "--", string(oldClip)).Run()
-		}()
-	}
 }

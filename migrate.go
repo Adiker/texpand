@@ -218,4 +218,3 @@ func removeKeysFromMapping(node *yaml.Node, keys ...string) int {
 	node.Content = filtered
 	return removed
 }
-

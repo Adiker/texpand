@@ -120,6 +120,14 @@ type Corrector struct {
 
 	undo    undoState
 	candBuf []string
+
+	// pending holds a correction that fired while Shift was physically
+	// held (e.g. on '!'). Compositors merge modifier state across
+	// keyboards, so typing through the virtual keyboard now would come
+	// out uppercase; the plan is released when Shift goes up, or dropped
+	// if any other key intervenes.
+	pending     *Plan
+	pendingUndo undoState
 }
 
 // New creates a Corrector. The dictionary can be attached later with
@@ -144,6 +152,20 @@ func New(opts Options) *Corrector {
 // loop goroutine.
 func (c *Corrector) SetLookup(l Lookup) { c.lookup = l }
 
+// SetOptions replaces the options (config hot-reload) and invalidates the
+// current word. Enabled state and the dictionary are preserved. Must be
+// called from the event loop goroutine.
+func (c *Corrector) SetOptions(opts Options) {
+	if opts.MinWordLength <= 0 {
+		opts.MinWordLength = 2
+	}
+	if opts.MaxWordLength <= 0 {
+		opts.MaxWordLength = 32
+	}
+	c.opts = opts
+	c.Invalidate()
+}
+
 // Ready reports whether a dictionary is attached.
 func (c *Corrector) Ready() bool { return c.lookup != nil }
 
@@ -163,6 +185,7 @@ func (c *Corrector) Reset() {
 	c.clearWord()
 	c.suppressed = false
 	c.undo.active = false
+	c.pending = nil
 	c.shift, c.ctrl, c.lalt, c.altgr, c.meta = false, false, false, false, false
 }
 
@@ -172,6 +195,7 @@ func (c *Corrector) Invalidate() {
 	c.clearWord()
 	c.suppressed = true
 	c.undo.active = false
+	c.pending = nil
 }
 
 func (c *Corrector) clearWord() {
@@ -211,6 +235,12 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	switch ev.Code {
 	case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
 		c.shift = ev.Value > 0
+		if !c.shift && c.pending != nil {
+			plan := c.pending
+			c.pending = nil
+			c.undo = c.pendingUndo
+			return Result{Plan: plan}
+		}
 		return Result{}
 	case evdev.KEY_LEFTCTRL, evdev.KEY_RIGHTCTRL:
 		c.ctrl = ev.Value > 0
@@ -229,6 +259,10 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	if ev.Value == 0 {
 		return Result{}
 	}
+
+	// Any key-down before Shift was released: the text has moved past the
+	// separator, so a pending correction no longer applies.
+	c.pending = nil
 
 	if ev.Code == evdev.KEY_CAPSLOCK {
 		if ev.Value == 1 {
@@ -430,9 +464,18 @@ func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
 		Backspaces: len(word) + 1, // the word plus the separator
 		Type:       cased + string(sep),
 	}
+	var undo undoState
 	if c.opts.Undo {
-		c.undo = undoState{active: true, typed: typed, outRunes: utf8.RuneCountInString(cased)}
+		undo = undoState{active: true, typed: typed, outRunes: utf8.RuneCountInString(cased)}
 	}
+	if c.shift {
+		// Shift is physically held (shifted separator): typing now would
+		// come out uppercase. Defer until Shift is released.
+		c.pending = plan
+		c.pendingUndo = undo
+		return Result{}
+	}
+	c.undo = undo
 	return Result{Plan: plan}
 }
 

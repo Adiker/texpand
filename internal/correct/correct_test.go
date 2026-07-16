@@ -51,43 +51,48 @@ func newDriver(t *testing.T, opts Options) *driver {
 	return &driver{t: t, c: c}
 }
 
-// key sends press+release and returns the press result.
-func (d *driver) key(code evdev.EvCode) Result {
-	r := d.c.HandleEvent(KeyEvent{Code: code, Value: 1})
-	d.c.HandleEvent(KeyEvent{Code: code, Value: 0})
+// send feeds one event, recording any non-empty result (plans can surface
+// on Shift release, so every event must be captured).
+func (d *driver) send(code evdev.EvCode, value int32) Result {
+	r := d.c.HandleEvent(KeyEvent{Code: code, Value: value})
 	if r.Plan != nil || r.Toggled {
 		d.results = append(d.results, r)
 	}
 	return r
 }
 
+// key sends press+release and returns the press result.
+func (d *driver) key(code evdev.EvCode) Result {
+	r := d.send(code, 1)
+	d.send(code, 0)
+	return r
+}
+
 // typeString types s using the Polish Programmer layout, pressing and
-// releasing Shift/AltGr around each character like a human would.
+// releasing Shift/AltGr around each character like a human would. It
+// returns the results recorded while typing s.
 func (d *driver) typeString(s string) []Result {
-	var out []Result
+	start := len(d.results)
 	for _, r := range s {
 		rk, ok := keymap.Reverse[r]
 		if !ok {
 			d.t.Fatalf("typeString: no key for %q", r)
 		}
 		if rk.Shift {
-			d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTSHIFT, Value: 1})
+			d.send(evdev.KEY_LEFTSHIFT, 1)
 		}
 		if rk.AltGr {
-			d.c.HandleEvent(KeyEvent{Code: evdev.KEY_RIGHTALT, Value: 1})
+			d.send(evdev.KEY_RIGHTALT, 1)
 		}
-		res := d.key(evdev.EvCode(rk.Code))
+		d.key(evdev.EvCode(rk.Code))
 		if rk.AltGr {
-			d.c.HandleEvent(KeyEvent{Code: evdev.KEY_RIGHTALT, Value: 0})
+			d.send(evdev.KEY_RIGHTALT, 0)
 		}
 		if rk.Shift {
-			d.c.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTSHIFT, Value: 0})
-		}
-		if res.Plan != nil || res.Toggled {
-			out = append(out, res)
+			d.send(evdev.KEY_LEFTSHIFT, 0)
 		}
 	}
-	return out
+	return d.results[start:]
 }
 
 func expectPlan(t *testing.T, results []Result, backspaces int, text string) {
@@ -302,6 +307,39 @@ func TestEnterCorrectionOptIn(t *testing.T) {
 	r := d.key(evdev.KEY_ENTER)
 	if r.Plan == nil || r.Plan.Backspaces != 5 || r.Plan.Type != "żółw\n" {
 		t.Fatalf("enter opt-in plan = %+v", r.Plan)
+	}
+}
+
+func TestShiftedSeparatorDefersUntilShiftRelease(t *testing.T) {
+	// '!' is Shift+1; typing through the virtual keyboard while the user
+	// still holds Shift would produce uppercase (modifier state is merged
+	// across keyboards). The plan must only appear on Shift release.
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	d.send(evdev.KEY_LEFTSHIFT, 1)
+	if r := d.send(evdev.KEY_1, 1); r.Plan != nil {
+		t.Fatal("plan emitted while shift held")
+	}
+	d.send(evdev.KEY_1, 0)
+	r := d.send(evdev.KEY_LEFTSHIFT, 0)
+	if r.Plan == nil || r.Plan.Type != "żółw!" {
+		t.Fatalf("plan on shift release = %+v", r.Plan)
+	}
+}
+
+func TestPendingPlanCancelledByNextKey(t *testing.T) {
+	// User keeps Shift held and types more: the deferred correction must
+	// be dropped, not applied to text that moved on.
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	d.send(evdev.KEY_LEFTSHIFT, 1)
+	d.send(evdev.KEY_1, 1) // '!' → pending
+	d.send(evdev.KEY_1, 0)
+	d.send(evdev.KEY_A, 1) // still shifted: "A"
+	d.send(evdev.KEY_A, 0)
+	r := d.send(evdev.KEY_LEFTSHIFT, 0)
+	if r.Plan != nil {
+		t.Fatalf("stale pending plan emitted: %+v", r.Plan)
 	}
 }
 

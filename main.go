@@ -13,11 +13,15 @@ import (
 	"github.com/bendahl/uinput"
 	"github.com/fsnotify/fsnotify"
 	evdev "github.com/holoplot/go-evdev"
+
+	"github.com/andresousadotpt/texpand/internal/control"
+	"github.com/andresousadotpt/texpand/internal/correct"
 )
 
 var (
-	version  = "dev"
-	debugLog bool
+	version     = "dev"
+	debugLog    bool
+	debugUnsafe bool
 )
 
 func init() {
@@ -34,6 +38,14 @@ func init() {
 func dbg(format string, args ...any) {
 	if debugLog {
 		fmt.Fprintf(os.Stderr, "texpand [DEBUG] "+format+"\n", args...)
+	}
+}
+
+// dbgUnsafe logs lines that can contain typed text. --debug alone never
+// prints captured words; this requires the explicit --debug-unsafe flag.
+func dbgUnsafe(format string, args ...any) {
+	if debugUnsafe {
+		fmt.Fprintf(os.Stderr, "texpand [DEBUG-UNSAFE] "+format+"\n", args...)
 	}
 }
 
@@ -114,7 +126,7 @@ func run() error {
 			continue
 		}
 
-		vkbd, err = uinput.CreateKeyboard("/dev/uinput", []byte("texpand"))
+		vkbd, err = uinput.CreateKeyboard("/dev/uinput", []byte(VirtualKeyboardName))
 		if err != nil {
 			// Close any keyboards we opened before retrying
 			for _, kb := range keyboards {
@@ -135,6 +147,21 @@ func run() error {
 	ch := make(chan KeyEvent, 64)
 	keyboardDone := make(chan keyboardMonitorExit, 64)
 	expander := NewExpander(cfg, vkbd)
+
+	acSettings, err := appCfg.Autocorrect.Normalized()
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	ac := newAutocorrect(acSettings, vkbd)
+	ac.startControl()
+	defer ac.shutdown()
+	ac.corrector.SetCapsLock(capsLockOn(keyboards))
+	if ac.corrector.Enabled() {
+		ac.maybeStartDictLoad()
+		fmt.Println("texpand: autocorrect enabled — loading Polish dictionary in background")
+	} else {
+		fmt.Println("texpand: autocorrect disabled (enable with: texpand autocorrect enable)")
+	}
 
 	fmt.Printf("texpand: monitoring %d keyboard(s) — %d triggers loaded\n",
 		len(keyboards), len(cfg.Matches))
@@ -182,23 +209,50 @@ func run() error {
 				return nil
 			}
 			if expander.HandleEvent(ev) {
+				// The expander rewrote text: the corrector's view of the
+				// screen is stale.
+				ac.corrector.Invalidate()
 				// Brief pause after expansion to avoid processing
 				// stale events from the physical keyboard.
 				time.Sleep(5 * time.Millisecond)
-			drain:
-				for {
-					select {
-					case <-ch:
-					default:
-						break drain
-					}
-				}
+				drainEvents(ch)
+				continue
 			}
+			res := ac.corrector.HandleEvent(correct.KeyEvent{Code: ev.Code, Value: ev.Value})
+			if res.Toggled {
+				enabled := !ac.corrector.Enabled()
+				ac.corrector.SetEnabled(enabled)
+				if enabled {
+					ac.maybeStartDictLoad()
+				}
+				ac.notifyToggle(enabled)
+				fmt.Printf("texpand: autocorrect %s (keyboard shortcut)\n", onOff(enabled))
+			}
+			if res.Plan != nil {
+				dbgUnsafe("correction: -%d chars, +%q (undo=%v)", res.Plan.Backspaces, res.Plan.Type, res.Undo)
+				if err := ac.writer.Apply(res.Plan.Backspaces, res.Plan.Type); err != nil {
+					fmt.Fprintf(os.Stderr, "texpand: correction output failed: %v\n", err)
+				}
+				// Our own uinput echo is invisible here (the virtual
+				// device is never monitored), but physical events queued
+				// while we typed are stale.
+				expander.ResetInputState()
+				time.Sleep(5 * time.Millisecond)
+				drainEvents(ch)
+			}
+		case ix := <-ac.dictCh:
+			ac.corrector.SetLookup(ix)
+			words, cands := ix.Stats()
+			fmt.Printf("texpand: Polish dictionary ready — %d word forms, %d correction candidates\n", words, cands)
+		case <-ac.loadReq:
+			ac.maybeStartDictLoad()
 		case stopped := <-keyboardDone:
 			if mon, ok := keyboardMonitors[stopped.path]; ok && mon.dev == stopped.dev {
 				mon.dev.Close()
 				delete(keyboardMonitors, stopped.path)
 				expander.ResetInputState()
+				ac.corrector.Reset()
+				ac.corrector.SetCapsLock(capsLockOnMonitors(keyboardMonitors))
 				fmt.Printf("texpand: keyboard disconnected: %s\n", mon.name)
 			}
 			resetTimer(keyboardDebounce, 500*time.Millisecond)
@@ -210,6 +264,8 @@ func run() error {
 			}
 			if changed {
 				expander.ResetInputState()
+				ac.corrector.Reset()
+				ac.corrector.SetCapsLock(capsLockOnMonitors(keyboardMonitors))
 				fmt.Printf("texpand: monitoring %d keyboard(s)\n", len(keyboardMonitors))
 			}
 		case <-keyboardRescan.C:
@@ -220,6 +276,8 @@ func run() error {
 			}
 			if changed {
 				expander.ResetInputState()
+				ac.corrector.Reset()
+				ac.corrector.SetCapsLock(capsLockOnMonitors(keyboardMonitors))
 				fmt.Printf("texpand: monitoring %d keyboard(s)\n", len(keyboardMonitors))
 			}
 		case <-configDebounce.C:
@@ -234,6 +292,11 @@ func run() error {
 				continue
 			}
 			expander.Reload(newCfg)
+			if newSettings, err := newAppCfg.Autocorrect.Normalized(); err != nil {
+				fmt.Fprintf(os.Stderr, "texpand: reload error (autocorrect settings kept): %v\n", err)
+			} else {
+				ac.applySettings(newSettings, vkbd)
+			}
 			fmt.Printf("texpand: config reloaded — %d triggers loaded\n", len(newCfg.Matches))
 		case event, ok := <-watcher.Events:
 			if !ok {
@@ -260,6 +323,25 @@ func run() error {
 			return nil
 		}
 	}
+}
+
+// drainEvents empties queued key events after we injected our own output,
+// so stale physical events cannot re-trigger a match.
+func drainEvents(ch <-chan KeyEvent) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+func onOff(v bool) string {
+	if v {
+		return "enabled"
+	}
+	return "disabled"
 }
 
 func newStoppedTimer() *time.Timer {
@@ -304,9 +386,12 @@ func main() {
 		switch args[0] {
 		case "--debug", "-d":
 			debugLog = true
+		case "--debug-unsafe":
+			debugLog = true
+			debugUnsafe = true
 		default:
 			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[0])
-			fmt.Fprintf(os.Stderr, "usage: texpand [--debug] [init|version|migrate]\n")
+			fmt.Fprintf(os.Stderr, "usage: texpand [--debug] [init|version|migrate|autocorrect <cmd>]\n")
 			os.Exit(1)
 		}
 		args = args[1:]
@@ -314,6 +399,18 @@ func main() {
 
 	if len(args) > 0 {
 		switch args[0] {
+		case "autocorrect":
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "usage: texpand autocorrect enable|disable|toggle|status\n")
+				os.Exit(1)
+			}
+			out, err := control.ClientCommand(args[1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println(out)
+			return
 		case "init":
 			dir := configDir()
 			fmt.Printf("texpand: initializing config in %s\n", dir)
@@ -334,7 +431,7 @@ func main() {
 			}
 			return
 		default:
-			fmt.Fprintf(os.Stderr, "usage: texpand [--debug] [init|version|migrate]\n")
+			fmt.Fprintf(os.Stderr, "usage: texpand [--debug] [init|version|migrate|autocorrect <cmd>]\n")
 			os.Exit(1)
 		}
 	}

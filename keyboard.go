@@ -13,6 +13,31 @@ type KeyEvent struct {
 	Value int32
 }
 
+// isMonitorableKeyboard decides whether a device with the given name and
+// key capabilities should be monitored. A keyboard must be able to produce
+// KEY_A and KEY_ENTER; the daemon's own virtual keyboard is skipped so its
+// generated events can never re-enter the pipeline.
+func isMonitorableKeyboard(name string, keyCodes []evdev.EvCode) bool {
+	if name == VirtualKeyboardName {
+		return false
+	}
+	hasA := false
+	hasEnter := false
+	for _, c := range keyCodes {
+		if c == evdev.KEY_A {
+			hasA = true
+		}
+		if c == evdev.KEY_ENTER {
+			hasEnter = true
+		}
+	}
+	return hasA && hasEnter
+}
+
+// VirtualKeyboardName is the uinput device name texpand creates; devices
+// carrying it are never monitored (feedback-loop prevention).
+const VirtualKeyboardName = "texpand"
+
 // FindKeyboards enumerates /dev/input/ devices and returns those that
 // have both KEY_A and KEY_ENTER capabilities (i.e., physical keyboards).
 func FindKeyboards() ([]*evdev.InputDevice, error) {
@@ -28,25 +53,8 @@ func FindKeyboards() ([]*evdev.InputDevice, error) {
 			continue
 		}
 
-		codes := dev.CapableEvents(evdev.EV_KEY)
-		hasA := false
-		hasEnter := false
-		for _, c := range codes {
-			if c == evdev.KEY_A {
-				hasA = true
-			}
-			if c == evdev.KEY_ENTER {
-				hasEnter = true
-			}
-		}
-
-		if hasA && hasEnter {
-			// Skip our own virtual keyboard to prevent feedback loops
-			name, _ := dev.Name()
-			if name == "texpand" {
-				dev.Close()
-				continue
-			}
+		name, _ := dev.Name()
+		if isMonitorableKeyboard(name, dev.CapableEvents(evdev.EV_KEY)) {
 			kbds = append(kbds, dev)
 		} else {
 			dev.Close()
@@ -54,6 +62,30 @@ func FindKeyboards() ([]*evdev.InputDevice, error) {
 	}
 
 	return kbds, nil
+}
+
+// capsLockOn reads the Caps Lock LED from the first keyboard that reports
+// one. Best effort: keyboards without the LED yield false.
+func capsLockOn(devs []*evdev.InputDevice) bool {
+	for _, dev := range devs {
+		st, err := dev.State(evdev.EV_LED)
+		if err != nil {
+			continue
+		}
+		if on, ok := st[evdev.LED_CAPSL]; ok && on {
+			return true
+		}
+	}
+	return false
+}
+
+// capsLockOnMonitors is capsLockOn over the currently monitored devices.
+func capsLockOnMonitors(monitors map[string]monitoredKeyboard) bool {
+	devs := make([]*evdev.InputDevice, 0, len(monitors))
+	for _, mon := range monitors {
+		devs = append(devs, mon.dev)
+	}
+	return capsLockOn(devs)
 }
 
 type monitoredKeyboard struct {
