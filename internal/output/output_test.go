@@ -101,6 +101,21 @@ func TestUinputUppercaseDiacritics(t *testing.T) {
 	}
 }
 
+func TestUinputCompensatesForCapsLock(t *testing.T) {
+	kbd := &fakeKbd{}
+	u := &Uinput{Kbd: kbd, CapsLock: func() bool { return true }}
+	if err := u.Type("aA"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"down:shift", "down:a", "up:a", "up:shift",
+		"down:a", "up:a",
+	}
+	if !slices.Equal(kbd.log, want) {
+		t.Fatalf("log = %v, want %v", kbd.log, want)
+	}
+}
+
 func TestUinputUnmappableEmitsNothing(t *testing.T) {
 	kbd := &fakeKbd{}
 	u := &Uinput{Kbd: kbd}

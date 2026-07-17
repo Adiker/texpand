@@ -16,6 +16,7 @@ import (
 
 	"github.com/andresousadotpt/texpand/internal/control"
 	"github.com/andresousadotpt/texpand/internal/correct"
+	"github.com/andresousadotpt/texpand/internal/inputstate"
 	"github.com/andresousadotpt/texpand/internal/output"
 )
 
@@ -151,16 +152,17 @@ func run() error {
 
 	ch := make(chan KeyEvent, 64)
 	keyboardDone := make(chan keyboardMonitorExit, 64)
-	expander := NewExpander(cfg, vkbd)
+	inputState := inputstate.New(capsLockOn(keyboards))
+	capsLock := func() bool { return inputState.Snapshot().Caps }
+	expander := NewExpander(cfg, vkbd, capsLock)
 
 	acSettings, err := appCfg.Autocorrect.Normalized()
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
-	ac := newAutocorrect(acSettings, vkbd)
+	ac := newAutocorrect(acSettings, vkbd, capsLock)
 	ac.startControl()
 	defer ac.shutdown()
-	ac.corrector.SetCapsLock(capsLockOn(keyboards))
 	if ac.corrector.Enabled() {
 		ac.maybeStartDictLoad()
 		fmt.Println("texpand: autocorrect enabled — loading Polish dictionary in background")
@@ -213,17 +215,19 @@ func run() error {
 			if !ok {
 				return nil
 			}
-			if expander.HandleEvent(ev) {
+			if !isCurrentKeyboardEvent(keyboardMonitors, ev) {
+				dbg("ignoring stale keyboard event from %s", ev.Device)
+				continue
+			}
+			ev.Modifiers = inputState.Handle(ev.Device, ev.Code, ev.Value)
+			expanded := expander.HandleEvent(ev)
+			res := ac.corrector.HandleEvent(correct.KeyEvent{Code: ev.Code, Value: ev.Value, Modifiers: ev.Modifiers})
+			if expanded {
 				// The expander rewrote text: the corrector's view of the
 				// screen is stale.
 				ac.corrector.Invalidate()
-				// Brief pause after expansion to avoid processing
-				// stale events from the physical keyboard.
-				time.Sleep(5 * time.Millisecond)
-				drainEvents(ch)
 				continue
 			}
-			res := ac.corrector.HandleEvent(correct.KeyEvent{Code: ev.Code, Value: ev.Value})
 			if res.Toggled {
 				enabled := !ac.corrector.Enabled()
 				ac.corrector.SetEnabled(enabled)
@@ -243,11 +247,9 @@ func run() error {
 					ac.corrector.Invalidate()
 				}
 				// Our own uinput echo is invisible here (the virtual
-				// device is never monitored), but physical events queued
-				// while we typed are stale.
+				// device is never monitored). Clear the expander's view;
+				// queued physical events remain valid and are processed next.
 				expander.ResetInputState()
-				time.Sleep(5 * time.Millisecond)
-				drainEvents(ch)
 			}
 		case ix := <-ac.dictCh:
 			ac.corrector.SetLookup(ix)
@@ -259,9 +261,10 @@ func run() error {
 			if mon, ok := keyboardMonitors[stopped.path]; ok && mon.dev == stopped.dev {
 				mon.dev.Close()
 				delete(keyboardMonitors, stopped.path)
+				inputState.Remove(stopped.path)
+				inputState.SetCaps(capsLockOnMonitors(keyboardMonitors))
 				expander.ResetInputState()
 				ac.corrector.Reset()
-				ac.corrector.SetCapsLock(capsLockOnMonitors(keyboardMonitors))
 				fmt.Printf("texpand: keyboard disconnected: %s\n", mon.name)
 			}
 			resetTimer(keyboardDebounce, 500*time.Millisecond)
@@ -272,9 +275,9 @@ func run() error {
 				continue
 			}
 			if changed {
+				inputState.Reset(capsLockOnMonitors(keyboardMonitors))
 				expander.ResetInputState()
 				ac.corrector.Reset()
-				ac.corrector.SetCapsLock(capsLockOnMonitors(keyboardMonitors))
 				fmt.Printf("texpand: monitoring %d keyboard(s)\n", len(keyboardMonitors))
 			}
 		case <-keyboardRescan.C:
@@ -284,9 +287,9 @@ func run() error {
 				continue
 			}
 			if changed {
+				inputState.Reset(capsLockOnMonitors(keyboardMonitors))
 				expander.ResetInputState()
 				ac.corrector.Reset()
-				ac.corrector.SetCapsLock(capsLockOnMonitors(keyboardMonitors))
 				fmt.Printf("texpand: monitoring %d keyboard(s)\n", len(keyboardMonitors))
 			}
 		case <-configDebounce.C:
@@ -304,7 +307,7 @@ func run() error {
 			if newSettings, err := newAppCfg.Autocorrect.Normalized(); err != nil {
 				fmt.Fprintf(os.Stderr, "texpand: reload error (autocorrect settings kept): %v\n", err)
 			} else {
-				ac.applySettings(newSettings, vkbd)
+				ac.applySettings(newSettings, vkbd, capsLock)
 			}
 			fmt.Printf("texpand: config reloaded — %d triggers loaded\n", len(newCfg.Matches))
 		case event, ok := <-watcher.Events:
@@ -330,18 +333,6 @@ func run() error {
 				mon.dev.Close()
 			}
 			return nil
-		}
-	}
-}
-
-// drainEvents empties queued key events after we injected our own output,
-// so stale physical events cannot re-trigger a match.
-func drainEvents(ch <-chan KeyEvent) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
 		}
 	}
 }

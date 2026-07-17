@@ -9,6 +9,7 @@ import (
 
 	"github.com/andresousadotpt/texpand/internal/appfilter"
 	"github.com/andresousadotpt/texpand/internal/correct"
+	"github.com/andresousadotpt/texpand/internal/inputstate"
 	"github.com/andresousadotpt/texpand/internal/keymap"
 	"github.com/andresousadotpt/texpand/internal/output"
 )
@@ -18,16 +19,17 @@ import (
 // the Polish Programmer layout. It implements output.Keyboard.
 type screen struct {
 	text  []rune
-	shift bool
-	altgr bool
+	shift int
+	altgr int
+	caps  bool
 }
 
 func (s *screen) KeyDown(k int) error {
 	switch k {
 	case uinput.KeyLeftshift, uinput.KeyRightshift:
-		s.shift = true
+		s.shift++
 	case uinput.KeyRightalt:
-		s.altgr = true
+		s.altgr++
 	default:
 		return s.KeyPress(k)
 	}
@@ -37,9 +39,13 @@ func (s *screen) KeyDown(k int) error {
 func (s *screen) KeyUp(k int) error {
 	switch k {
 	case uinput.KeyLeftshift, uinput.KeyRightshift:
-		s.shift = false
+		if s.shift > 0 {
+			s.shift--
+		}
 	case uinput.KeyRightalt:
-		s.altgr = false
+		if s.altgr > 0 {
+			s.altgr--
+		}
 	}
 	return nil
 }
@@ -47,6 +53,9 @@ func (s *screen) KeyUp(k int) error {
 func (s *screen) KeyPress(k int) error {
 	code := evdev.EvCode(k)
 	switch code {
+	case evdev.KEY_CAPSLOCK:
+		s.caps = !s.caps
+		return nil
 	case evdev.KEY_BACKSPACE:
 		if len(s.text) > 0 {
 			s.text = s.text[:len(s.text)-1]
@@ -59,9 +68,9 @@ func (s *screen) KeyPress(k int) error {
 		s.text = append(s.text, '\t')
 		return nil
 	}
-	if s.altgr {
+	if s.altgr > 0 {
 		if r, ok := keymap.AltGr[code]; ok {
-			if s.shift {
+			if (s.shift > 0) != s.caps {
 				r = []rune(strings.ToUpper(string(r)))[0]
 			}
 			s.text = append(s.text, r)
@@ -70,7 +79,11 @@ func (s *screen) KeyPress(k int) error {
 	}
 	if kc, ok := keymap.Chars[code]; ok {
 		ch := kc.Normal
-		if s.shift {
+		useShift := s.shift > 0
+		if len(kc.Normal) == 1 && kc.Normal[0] >= 'a' && kc.Normal[0] <= 'z' && s.caps {
+			useShift = !useShift
+		}
+		if useShift {
 			ch = kc.Shifted
 		}
 		s.text = append(s.text, []rune(ch)...)
@@ -87,6 +100,7 @@ type rig struct {
 	scr       *screen
 	corrector *correct.Corrector
 	writer    *output.Writer
+	tracker   *inputstate.Tracker
 }
 
 type rigLookup struct{}
@@ -109,10 +123,12 @@ func (rigLookup) Candidates(k string, buf []string) []string {
 
 func newRig(t *testing.T, opts correct.Options) *rig {
 	scr := &screen{}
+	tracker := inputstate.New(false)
 	c := correct.New(opts)
 	c.SetLookup(rigLookup{})
-	w := &output.Writer{Kbd: scr, Backends: []output.Backend{&output.Uinput{Kbd: scr}}}
-	return &rig{t: t, scr: scr, corrector: c, writer: w}
+	capsLock := func() bool { return tracker.Snapshot().Caps }
+	w := &output.Writer{Kbd: scr, Backends: []output.Backend{&output.Uinput{Kbd: scr, CapsLock: capsLock}}, CapsLock: capsLock}
+	return &rig{t: t, scr: scr, corrector: c, writer: w, tracker: tracker}
 }
 
 // event feeds one raw event through the pipeline: the "app" (screen) sees
@@ -136,7 +152,8 @@ func (r *rig) event(code evdev.EvCode, value int32) {
 			r.scr.KeyUp(uinput.KeyRightalt)
 		}
 	}
-	res := r.corrector.HandleEvent(correct.KeyEvent{Code: code, Value: value})
+	mods := r.tracker.Handle("kbd", code, value)
+	res := r.corrector.HandleEvent(correct.KeyEvent{Code: code, Value: value, Modifiers: mods})
 	if res.Plan != nil {
 		edit := output.Edit{Backspaces: res.Plan.Backspaces, Text: res.Plan.Type, Restore: res.Plan.Restore}
 		if err := r.writer.Apply(edit); err != nil {
@@ -210,12 +227,20 @@ func TestEndToEndUndo(t *testing.T) {
 	r.expect("zolw ")
 }
 
+func TestEndToEndCorrectionWithCapsLock(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.key(evdev.KEY_CAPSLOCK)
+	r.typeString("zolw ")
+	r.expect("ŻÓŁW ")
+}
+
 func TestEndToEndCtrlShortcut(t *testing.T) {
 	r := newRig(t, correct.DefaultOptions())
 	r.typeString("zolw")
 	r.event(evdev.KEY_LEFTCTRL, 1)
-	r.corrector.HandleEvent(correct.KeyEvent{Code: evdev.KEY_C, Value: 1}) // Ctrl+C: app gets no char
-	r.corrector.HandleEvent(correct.KeyEvent{Code: evdev.KEY_C, Value: 0})
+	mods := r.tracker.Snapshot()
+	r.corrector.HandleEvent(correct.KeyEvent{Code: evdev.KEY_C, Value: 1, Modifiers: mods}) // Ctrl+C: app gets no char
+	r.corrector.HandleEvent(correct.KeyEvent{Code: evdev.KEY_C, Value: 0, Modifiers: mods})
 	r.event(evdev.KEY_LEFTCTRL, 0)
 	r.typeString(" ")
 	r.expect("zolw ") // buffer invalidated → untouched
@@ -265,17 +290,47 @@ func expanderConfig(mode string) *Config {
 
 // expanderRig drives the Expander against the simulated screen.
 type expanderRig struct {
-	t   *testing.T
-	scr *screen
-	e   *Expander
+	t       *testing.T
+	scr     *screen
+	e       *Expander
+	tracker *inputstate.Tracker
 }
 
 func newExpanderRig(t *testing.T, mode string) *expanderRig {
 	scr := &screen{}
-	e := NewExpander(expanderConfig(mode), scr)
+	tracker := inputstate.New(false)
+	capsLock := func() bool { return tracker.Snapshot().Caps }
+	e := NewExpander(expanderConfig(mode), scr, capsLock)
 	// Restrict output to uinput so the test never shells out to wtype.
-	e.writer = &output.Writer{Kbd: scr, Backends: []output.Backend{&output.Uinput{Kbd: scr}}}
-	return &expanderRig{t: t, scr: scr, e: e}
+	e.writer = &output.Writer{Kbd: scr, Backends: []output.Backend{&output.Uinput{Kbd: scr, CapsLock: capsLock}}, CapsLock: capsLock}
+	return &expanderRig{t: t, scr: scr, e: e, tracker: tracker}
+}
+
+func (r *expanderRig) event(code evdev.EvCode, value int32) bool {
+	return r.eventDevice("kbd", code, value)
+}
+
+func (r *expanderRig) eventDevice(device string, code evdev.EvCode, value int32) bool {
+	switch code {
+	case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
+		if value > 0 {
+			r.scr.KeyDown(uinput.KeyLeftshift)
+		} else {
+			r.scr.KeyUp(uinput.KeyLeftshift)
+		}
+	case evdev.KEY_RIGHTALT:
+		if value > 0 {
+			r.scr.KeyDown(uinput.KeyRightalt)
+		} else {
+			r.scr.KeyUp(uinput.KeyRightalt)
+		}
+	case evdev.KEY_CAPSLOCK:
+		if value == 1 {
+			r.scr.KeyPress(int(code))
+		}
+	}
+	mods := r.tracker.Handle(device, code, value)
+	return r.e.HandleEvent(KeyEvent{Device: device, Code: code, Value: value, Modifiers: mods})
 }
 
 func (r *expanderRig) typeString(s string) {
@@ -285,15 +340,13 @@ func (r *expanderRig) typeString(s string) {
 			r.t.Fatalf("no key for %q", ru)
 		}
 		if rk.Shift {
-			r.e.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTSHIFT, Value: 1})
-			r.scr.KeyDown(uinput.KeyLeftshift)
+			r.event(evdev.KEY_LEFTSHIFT, 1)
 		}
 		r.scr.KeyPress(rk.Code)
-		r.e.HandleEvent(KeyEvent{Code: evdev.EvCode(rk.Code), Value: 1})
-		r.e.HandleEvent(KeyEvent{Code: evdev.EvCode(rk.Code), Value: 0})
+		r.event(evdev.EvCode(rk.Code), 1)
+		r.event(evdev.EvCode(rk.Code), 0)
 		if rk.Shift {
-			r.e.HandleEvent(KeyEvent{Code: evdev.KEY_LEFTSHIFT, Value: 0})
-			r.scr.KeyUp(uinput.KeyLeftshift)
+			r.event(evdev.KEY_LEFTSHIFT, 0)
 		}
 	}
 }
@@ -312,6 +365,67 @@ func TestExpanderStillWorksImmediateMode(t *testing.T) {
 	if got := r.scr.String(); got != "user@example.com" {
 		t.Fatalf("screen = %q", got)
 	}
+}
+
+func TestExpanderDefersShiftedFinalCharacter(t *testing.T) {
+	r := newExpanderRig(t, "immediate")
+	r.e.Reload(&Config{TriggerMode: "immediate", Matches: []Match{{Trigger: ":A", Replace: "done"}}})
+	r.typeString(":A")
+	if got := r.scr.String(); got != "done" {
+		t.Fatalf("screen = %q, want deferred expansion after Shift release", got)
+	}
+}
+
+func TestExpanderWaitsForShiftOnEveryKeyboard(t *testing.T) {
+	r := newExpanderRig(t, "immediate")
+	r.e.Reload(&Config{TriggerMode: "immediate", Matches: []Match{{Trigger: ":A", Replace: "done"}}})
+	r.typeString(":")
+	r.eventDevice("kbd-a", evdev.KEY_LEFTSHIFT, 1)
+	r.eventDevice("kbd-b", evdev.KEY_RIGHTSHIFT, 1)
+	r.scr.KeyPress(int(evdev.KEY_A))
+	if expanded := r.eventDevice("kbd-a", evdev.KEY_A, 1); expanded {
+		t.Fatal("expanded while both Shift keys were held")
+	}
+	r.eventDevice("kbd-a", evdev.KEY_A, 0)
+	if expanded := r.eventDevice("kbd-a", evdev.KEY_LEFTSHIFT, 0); expanded {
+		t.Fatal("expanded while the second keyboard still held Shift")
+	}
+	if expanded := r.eventDevice("kbd-b", evdev.KEY_RIGHTSHIFT, 0); !expanded {
+		t.Fatal("did not expand after the final Shift release")
+	}
+	if got := r.scr.String(); got != "done" {
+		t.Fatalf("screen = %q, want %q", got, "done")
+	}
+}
+
+func TestExpanderTracksCapsLockAndTypesDesiredCase(t *testing.T) {
+	r := newExpanderRig(t, "immediate")
+	r.e.Reload(&Config{TriggerMode: "immediate", Matches: []Match{{Trigger: "AB", Replace: "ok"}}})
+	r.event(evdev.KEY_CAPSLOCK, 1)
+	for _, code := range []evdev.EvCode{evdev.KEY_A, evdev.KEY_B} {
+		r.scr.KeyPress(int(code))
+		r.event(code, 1)
+		r.event(code, 0)
+	}
+	if got := r.scr.String(); got != "ok" {
+		t.Fatalf("screen = %q, want lowercase replacement under Caps Lock", got)
+	}
+}
+
+func TestExpanderIgnoresKeysHeldWithCtrl(t *testing.T) {
+	r := newExpanderRig(t, "immediate")
+	r.e.Reload(&Config{TriggerMode: "immediate", Matches: []Match{{Trigger: "ba", Replace: "expanded"}}})
+	r.event(evdev.KEY_LEFTCTRL, 1)
+	if expanded := r.event(evdev.KEY_B, 1); expanded {
+		t.Fatal("Ctrl+B polluted the trigger buffer")
+	}
+	r.event(evdev.KEY_B, 0)
+	r.event(evdev.KEY_LEFTCTRL, 0)
+	r.scr.KeyPress(int(evdev.KEY_A))
+	if expanded := r.event(evdev.KEY_A, 1); expanded {
+		t.Fatal("Ctrl+B remained in the buffer and formed a false trigger")
+	}
+	r.event(evdev.KEY_A, 0)
 }
 
 func TestOwnVirtualKeyboardNeverMonitored(t *testing.T) {

@@ -38,7 +38,7 @@ type autocorrect struct {
 // newAutocorrect builds the subsystem from validated settings. The
 // dictionary is NOT loaded here; the main loop starts loading via
 // maybeStartDictLoad so the daemon is monitoring keys immediately.
-func newAutocorrect(settings AutocorrectSettings, vkbd output.Keyboard) *autocorrect {
+func newAutocorrect(settings AutocorrectSettings, vkbd output.Keyboard, capsLock func() bool) *autocorrect {
 	ac := &autocorrect{
 		settings: settings,
 		tracker:  &appfilter.Tracker{},
@@ -50,8 +50,9 @@ func newAutocorrect(settings AutocorrectSettings, vkbd output.Keyboard) *autocor
 	ac.corrector.SetEnabled(settings.Enabled)
 	ac.writer = &output.Writer{
 		Kbd:      vkbd,
-		Backends: buildBackends(settings, vkbd),
+		Backends: buildBackends(settings, vkbd, capsLock),
 		Debug:    dbg,
+		CapsLock: capsLock,
 	}
 	ac.notifyOnToggle.Store(settings.NotifyOnToggle)
 	return ac
@@ -71,16 +72,16 @@ func (ac *autocorrect) correctorOptions(s AutocorrectSettings) correct.Options {
 	}
 }
 
-func buildBackends(s AutocorrectSettings, vkbd output.Keyboard) []output.Backend {
+func buildBackends(s AutocorrectSettings, vkbd output.Keyboard, capsLock func() bool) []output.Backend {
 	var backends []output.Backend
 	wt := &output.Wtype{}
 	switch s.Output {
 	case "uinput":
-		backends = []output.Backend{&output.Uinput{Kbd: vkbd}}
+		backends = []output.Backend{&output.Uinput{Kbd: vkbd, CapsLock: capsLock}}
 	case "wtype":
 		backends = []output.Backend{wt}
 	default: // auto
-		backends = []output.Backend{&output.Uinput{Kbd: vkbd}}
+		backends = []output.Backend{&output.Uinput{Kbd: vkbd, CapsLock: capsLock}}
 		if wt.Available() {
 			backends = append(backends, wt)
 		}
@@ -169,13 +170,13 @@ func loadIndex(s AutocorrectSettings) (*dict.Index, error) {
 
 // applySettings applies a hot-reloaded configuration. Runs on the main
 // loop goroutine.
-func (ac *autocorrect) applySettings(s AutocorrectSettings, vkbd output.Keyboard) {
+func (ac *autocorrect) applySettings(s AutocorrectSettings, vkbd output.Keyboard, capsLock func() bool) {
 	oldEnabled := ac.settings.Enabled
 	ac.settings = s
 	ac.notifyOnToggle.Store(s.NotifyOnToggle)
 	ac.excluder.Configure(s.ExcludedApps, s.CorrectOnUnknownApp)
 	ac.corrector.SetOptions(ac.correctorOptions(s))
-	ac.writer.Backends = buildBackends(s, vkbd)
+	ac.writer.Backends = buildBackends(s, vkbd, capsLock)
 	if s.Enabled != oldEnabled {
 		ac.corrector.SetEnabled(s.Enabled)
 	}

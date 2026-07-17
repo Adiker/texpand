@@ -8,38 +8,45 @@ import (
 	"github.com/bendahl/uinput"
 	evdev "github.com/holoplot/go-evdev"
 
+	"github.com/andresousadotpt/texpand/internal/inputstate"
 	"github.com/andresousadotpt/texpand/internal/keymap"
 	"github.com/andresousadotpt/texpand/internal/output"
 )
 
+type pendingExpansion struct {
+	match           Match
+	extraBackspaces int
+}
+
 // Expander maintains a rolling keystroke buffer and triggers text
 // expansion when a match is detected.
 type Expander struct {
-	config *Config
-	vkbd   output.Keyboard
-	writer *output.Writer
-	buf    string
-	shift  bool
-	maxLen int
+	config    *Config
+	vkbd      output.Keyboard
+	writer    *output.Writer
+	buf       string
+	modifiers inputstate.Modifiers
+	pending   *pendingExpansion
+	maxLen    int
 }
 
 // NewExpander creates an Expander with the given config and virtual keyboard.
 // Replacement text goes through the output writer (uinput with wtype and
 // clipboard fallbacks, matching the pre-refactor behaviour).
-func NewExpander(cfg *Config, vkbd output.Keyboard) *Expander {
+func NewExpander(cfg *Config, vkbd output.Keyboard, capsLock func() bool) *Expander {
 	maxLen := 0
 	for _, m := range cfg.Matches {
 		if len(m.Trigger) > maxLen {
 			maxLen = len(m.Trigger)
 		}
 	}
-	backends := []output.Backend{&output.Uinput{Kbd: vkbd}}
+	backends := []output.Backend{&output.Uinput{Kbd: vkbd, CapsLock: capsLock}}
 	wt := &output.Wtype{}
 	if wt.Available() {
 		backends = append(backends, wt)
 	}
 	backends = append(backends, &output.Clipboard{Kbd: vkbd, Report: reportOutputError})
-	writer := &output.Writer{Kbd: vkbd, Backends: backends, Debug: dbg}
+	writer := &output.Writer{Kbd: vkbd, Backends: backends, Debug: dbg, CapsLock: capsLock}
 	return &Expander{config: cfg, vkbd: vkbd, writer: writer, maxLen: maxLen}
 }
 
@@ -62,7 +69,27 @@ func (e *Expander) Reload(cfg *Config) {
 // disconnects or reconnects.
 func (e *Expander) ResetInputState() {
 	e.buf = ""
-	e.shift = false
+	e.pending = nil
+	e.modifiers = inputstate.Modifiers{Caps: e.modifiers.Caps}
+}
+
+func (e *Expander) expandOrDefer(m Match, extraBackspaces int) bool {
+	if e.modifiers.Shift || e.modifiers.AltGr {
+		e.pending = &pendingExpansion{match: m, extraBackspaces: extraBackspaces}
+		return false
+	}
+	e.performExpansion(m, extraBackspaces)
+	return true
+}
+
+func (e *Expander) maybeReleasePending() bool {
+	if e.pending == nil || e.modifiers.Shift || e.modifiers.AltGr {
+		return false
+	}
+	pending := e.pending
+	e.pending = nil
+	e.performExpansion(pending.match, pending.extraBackspaces)
+	return true
 }
 
 // performExpansion handles the full expansion sequence: backspace the
@@ -97,18 +124,39 @@ func (e *Expander) performExpansion(m Match, extraBackspaces int) {
 	}
 }
 
-// HandleEvent processes a single key event: tracks shift state, manages
-// the buffer, and fires expansions. Returns true if an expansion was
-// performed (caller should drain the event channel).
+// HandleEvent processes a single key event, manages the rolling buffer, and
+// fires expansions. It returns true when an expansion was performed.
 func (e *Expander) HandleEvent(ev KeyEvent) bool {
-	// Track shift state
-	if ev.Code == evdev.KEY_LEFTSHIFT || ev.Code == evdev.KEY_RIGHTSHIFT {
-		e.shift = ev.Value > 0
+	e.modifiers = ev.Modifiers
+
+	// Modifier events update shared state before either text subsystem sees
+	// them. Output-altering modifiers may release a deferred expansion.
+	switch ev.Code {
+	case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
+		return e.maybeReleasePending()
+	case evdev.KEY_RIGHTALT:
+		if ev.Value == 1 && e.pending == nil {
+			e.buf = ""
+		}
+		return e.maybeReleasePending()
+	case evdev.KEY_LEFTCTRL, evdev.KEY_RIGHTCTRL,
+		evdev.KEY_LEFTALT, evdev.KEY_LEFTMETA, evdev.KEY_RIGHTMETA:
+		if ev.Value == 1 {
+			e.buf = ""
+			e.pending = nil
+		}
 		return false
 	}
 
 	// Only process key-down events
 	if ev.Value != 1 {
+		return false
+	}
+	if e.pending != nil {
+		e.pending = nil
+	}
+	if e.modifiers.Ctrl || e.modifiers.Alt || e.modifiers.AltGr || e.modifiers.Meta {
+		e.buf = ""
 		return false
 	}
 
@@ -135,9 +183,8 @@ func (e *Expander) HandleEvent(ev KeyEvent) bool {
 				continue
 			}
 			dbg("match: trigger=%q → expanding", m.Trigger)
-			e.performExpansion(m, 1) // +1 for the space
 			e.buf = ""
-			return true
+			return e.expandOrDefer(m, 1) // +1 for the space
 		}
 		e.buf = ""
 		return false
@@ -149,8 +196,12 @@ func (e *Expander) HandleEvent(ev KeyEvent) bool {
 		return false
 	}
 
+	useShift := e.modifiers.Shift
+	if len(kc.Normal) == 1 && kc.Normal[0] >= 'a' && kc.Normal[0] <= 'z' && e.modifiers.Caps {
+		useShift = !useShift
+	}
 	ch := kc.Normal
-	if e.shift {
+	if useShift {
 		ch = kc.Shifted
 	}
 
@@ -167,9 +218,8 @@ func (e *Expander) HandleEvent(ev KeyEvent) bool {
 				continue
 			}
 			dbg("match: trigger=%q → expanding", m.Trigger)
-			e.performExpansion(m, 0)
 			e.buf = ""
-			return true
+			return e.expandOrDefer(m, 0)
 		}
 	}
 	return false
