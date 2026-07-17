@@ -174,7 +174,7 @@ func (w *Wtype) Type(text string) error {
 	out, err := exec.Command("wtype", "--", text).CombinedOutput()
 	if err != nil {
 		w.broken = true
-		return fmt.Errorf("%w: wtype: %v: %s", ErrOutputMayBePartial, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("wtype: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
