@@ -1,12 +1,30 @@
-# Agents
+# AGENTS.md - texpand
 
-Context for AI coding agents working on this project.
+Comprehensive project docs are in `CONTRIBUTING.md` and `README.md`. This file
+contains the mandatory guardrails for AI agents and automation working in this
+repository.
 
-## Project overview
+## Git Workflow
 
-**texpand** is a lightweight, single-binary Wayland text expander written in Go. It reads raw keyboard events via evdev, maintains a rolling keystroke buffer, and when a trigger matches it backspaces the trigger text, copies the replacement to clipboard, and pastes via Ctrl+V. Clipboard contents are preserved and restored after paste.
+- Never commit directly to `main` unless the user explicitly asks for it.
+- Work on branches with one of these prefixes: `feature/`, `fix/`,
+  `refactor/`, `docs/`, `chore/`.
+- Do not force-push `main`.
+- Do not delete protected or shared branches, or another contributor's active
+  branch, without explicit owner consent.
+- Do not rewrite published history without explicit consent.
+- Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the recommended workflow,
+  including commit and merge strategy.
+- Before opening a PR, run the tests relevant to the changed parts.
+- If tests are not available yet, state that clearly in the PR description.
 
-Wayland-only. Requires `wl-clipboard` at runtime and access to `/dev/input/` and `/dev/uinput`.
+## Documentation Rules
+
+- Update `README.md` for end-user behavior, setup, and troubleshooting.
+- Update `CONTRIBUTING.md` for development workflow changes.
+- Update `AGENTS.md` for AI agent workflow changes.
+- If documentation does not need changes, say that explicitly in the PR
+  description.
 
 ## Architecture
 
@@ -20,6 +38,8 @@ config_defaults.go→ Embedded default configs (//go:embed), extracted on `texpa
 migrate.go        → Versioned config migration system (texpand migrate)
 variables.go      → Variable resolution (date type with offset), {{ref}} expansion
 strftime.go       → Strftime token replacement (%Y, %m, %d, etc.)
+autocorrect.go    → Polish autocorrection engine
+autocorrect_config.go → Autocorrection configuration loading
 ```
 
 ### Control flow
