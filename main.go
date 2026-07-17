@@ -215,6 +215,10 @@ func run() error {
 			if !ok {
 				return nil
 			}
+			if !isCurrentKeyboardEvent(keyboardMonitors, ev) {
+				dbg("ignoring stale keyboard event from %s", ev.Device)
+				continue
+			}
 			ev.Modifiers = inputState.Handle(ev.Device, ev.Code, ev.Value)
 			expanded := expander.HandleEvent(ev)
 			res := ac.corrector.HandleEvent(correct.KeyEvent{Code: ev.Code, Value: ev.Value, Modifiers: ev.Modifiers})

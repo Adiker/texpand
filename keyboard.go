@@ -12,6 +12,7 @@ import (
 // from a keyboard monitoring goroutine.
 type KeyEvent struct {
 	Device    string
+	Source    *evdev.InputDevice
 	Code      evdev.EvCode
 	Value     int32
 	Modifiers inputstate.Modifiers
@@ -97,6 +98,14 @@ type monitoredKeyboard struct {
 	name string
 }
 
+// isCurrentKeyboardEvent rejects events queued by a monitor that has already
+// stopped. Comparing the device pointer as well as its path also covers an
+// event node that was recreated at the same path with a new monitor.
+func isCurrentKeyboardEvent(monitors map[string]monitoredKeyboard, ev KeyEvent) bool {
+	mon, ok := monitors[ev.Device]
+	return ok && mon.dev == ev.Source
+}
+
 type keyboardMonitorExit struct {
 	path string
 	dev  *evdev.InputDevice
@@ -164,7 +173,7 @@ func MonitorKeyboard(dev *evdev.InputDevice, ch chan<- KeyEvent, done chan<- key
 			return
 		}
 		if ev.Type == evdev.EV_KEY {
-			ch <- KeyEvent{Device: path, Code: ev.Code, Value: ev.Value}
+			ch <- KeyEvent{Device: path, Source: dev, Code: ev.Code, Value: ev.Value}
 		}
 	}
 }
