@@ -251,10 +251,8 @@ func run() error {
 				// queued physical events remain valid and are processed next.
 				expander.ResetInputState()
 			}
-		case ix := <-ac.dictCh:
-			ac.corrector.SetLookup(ix)
-			words, cands := ix.Stats()
-			fmt.Printf("texpand: Polish dictionary ready — %d word forms, %d correction candidates\n", words, cands)
+		case result := <-ac.dictCh:
+			ac.handleDictLoadResult(result)
 		case <-ac.loadReq:
 			ac.maybeStartDictLoad()
 		case stopped := <-keyboardDone:
