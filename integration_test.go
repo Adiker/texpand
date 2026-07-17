@@ -28,6 +28,8 @@ func (s *screen) KeyDown(k int) error {
 		s.shift = true
 	case uinput.KeyRightalt:
 		s.altgr = true
+	default:
+		return s.KeyPress(k)
 	}
 	return nil
 }
@@ -136,7 +138,8 @@ func (r *rig) event(code evdev.EvCode, value int32) {
 	}
 	res := r.corrector.HandleEvent(correct.KeyEvent{Code: code, Value: value})
 	if res.Plan != nil {
-		if err := r.writer.Apply(res.Plan.Backspaces, res.Plan.Type); err != nil {
+		edit := output.Edit{Backspaces: res.Plan.Backspaces, Text: res.Plan.Type, Restore: res.Plan.Restore}
+		if err := r.writer.Apply(edit); err != nil {
 			r.t.Fatalf("writer: %v", err)
 		}
 	}

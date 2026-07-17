@@ -34,6 +34,7 @@ type KeyEvent struct {
 type Plan struct {
 	Backspaces int
 	Type       string
+	Restore    string
 }
 
 // Result is what handling one event produced.
@@ -94,6 +95,7 @@ func DefaultOptions() Options {
 type undoState struct {
 	active   bool
 	typed    string // what the user had typed, with case
+	emitted  string // corrected word currently visible on screen
 	outRunes int    // rune length of the corrected word we emitted
 }
 
@@ -308,7 +310,7 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		if c.undo.active && ev.Value == 1 {
 			// The physical Backspace has just deleted the separator; we
 			// delete the corrected word and restore what was typed.
-			plan := &Plan{Backspaces: c.undo.outRunes, Type: c.undo.typed}
+			plan := &Plan{Backspaces: c.undo.outRunes, Type: c.undo.typed, Restore: c.undo.emitted}
 			c.buf = append(c.buf[:0], []rune(c.undo.typed)...)
 			c.impure = false
 			c.overflow = false
@@ -469,10 +471,11 @@ func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
 	plan := &Plan{
 		Backspaces: len(word) + 1, // the word plus the separator
 		Type:       cased + string(sep),
+		Restore:    typed + string(sep),
 	}
 	var undo undoState
 	if c.opts.Undo {
-		undo = undoState{active: true, typed: typed, outRunes: utf8.RuneCountInString(cased)}
+		undo = undoState{active: true, typed: typed, emitted: cased, outRunes: utf8.RuneCountInString(cased)}
 	}
 	if c.shift || c.altgr {
 		// Shift/AltGr is physically held (shifted separator, or a fast

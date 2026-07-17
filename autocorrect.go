@@ -86,7 +86,7 @@ func buildBackends(s AutocorrectSettings, vkbd output.Keyboard) []output.Backend
 		}
 	}
 	if s.AllowClipboardFallback {
-		backends = append(backends, &output.Clipboard{Kbd: vkbd})
+		backends = append(backends, &output.Clipboard{Kbd: vkbd, Report: reportOutputError})
 	}
 	return backends
 }

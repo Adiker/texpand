@@ -16,6 +16,7 @@ import (
 
 	"github.com/andresousadotpt/texpand/internal/control"
 	"github.com/andresousadotpt/texpand/internal/correct"
+	"github.com/andresousadotpt/texpand/internal/output"
 )
 
 var (
@@ -47,6 +48,10 @@ func dbgUnsafe(format string, args ...any) {
 	if debugUnsafe {
 		fmt.Fprintf(os.Stderr, "texpand [DEBUG-UNSAFE] "+format+"\n", args...)
 	}
+}
+
+func reportOutputError(err error) {
+	fmt.Fprintf(os.Stderr, "texpand: output error: %v\n", err)
 }
 
 func ensureWaylandEnv() {
@@ -230,8 +235,12 @@ func run() error {
 			}
 			if res.Plan != nil {
 				dbgUnsafe("correction: -%d chars, +%q (undo=%v)", res.Plan.Backspaces, res.Plan.Type, res.Undo)
-				if err := ac.writer.Apply(res.Plan.Backspaces, res.Plan.Type); err != nil {
+				edit := output.Edit{Backspaces: res.Plan.Backspaces, Text: res.Plan.Type, Restore: res.Plan.Restore}
+				if err := ac.writer.Apply(edit); err != nil {
 					fmt.Fprintf(os.Stderr, "texpand: correction output failed: %v\n", err)
+					// The corrector prepared undo state before output ran. It is
+					// no longer trustworthy after any failed edit or recovery.
+					ac.corrector.Invalidate()
 				}
 				// Our own uinput echo is invisible here (the virtual
 				// device is never monitored), but physical events queued
