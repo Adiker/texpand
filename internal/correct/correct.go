@@ -289,9 +289,12 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		return Result{}
 	}
 
-	// Autorepeat of the gating separator must not cancel the deferred plan;
-	// only a different key-down means the text moved on.
+	// Autorepeat of the gating separator means the app already received
+	// another suffix character. The pending PreserveSuffix plan only knows
+	// about one separator, so applying it would edit from the wrong cursor
+	// position — drop the plan instead.
 	if ev.Value == 2 && c.pending != nil && c.heldSep != 0 && ev.Code == c.heldSep {
+		c.clearPending()
 		return Result{}
 	}
 

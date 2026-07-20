@@ -463,19 +463,22 @@ func TestSuppressionSurvivesTempCharDelete(t *testing.T) {
 	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
-func TestSeparatorRepeatDoesNotCancelPending(t *testing.T) {
+func TestSeparatorRepeatCancelsPending(t *testing.T) {
+	// A held Space autorepeats into the app as extra separators. The deferred
+	// PreserveSuffix plan only accounts for one, so repeat must cancel it.
 	d := newDriver(t, DefaultOptions())
 	d.typeString("zolw")
 	if r := d.send(evdev.KEY_SPACE, 1); r.Plan != nil {
 		t.Fatal("plan on Space down")
 	}
-	if r := d.send(evdev.KEY_SPACE, 2); r.Plan != nil { // autorepeat
+	if r := d.send(evdev.KEY_SPACE, 2); r.Plan != nil {
 		t.Fatal("plan on Space repeat")
 	}
-	r := d.send(evdev.KEY_SPACE, 0)
-	if r.Plan == nil || r.Plan.Type != "żółw" {
-		t.Fatalf("plan on Space release after repeat = %+v", r.Plan)
+	if r := d.send(evdev.KEY_SPACE, 0); r.Plan != nil {
+		t.Fatalf("stale plan after Space repeat: %+v", r.Plan)
 	}
+	// After the cancelled boundary, a fresh word still corrects.
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
 func TestUndoOnlyImmediately(t *testing.T) {
