@@ -211,9 +211,8 @@ emit Shift, so `ZOLW` typed with Caps Lock also outputs uppercase correctly.
 1. **uinput / Polish Programmer** (primary): ASCII via the US reverse map,
    Polish diacritics via AltGr(+Shift) combinations (`ż`=AltGr+Z,
    `ź`=AltGr+X, …). Fastest path, no subprocess, works because KDE applies
-   the user's layout to the virtual keyboard. Short sleeps between AltGr
-   chords are required — without them compositors reorder or drop the
-   diacritic keys (e.g. `żółw` arriving as `w żó…`).
+   the user's layout to the virtual keyboard. Short sleeps around AltGr/Shift
+   chords keep diacritics in order; plain ASCII is not delayed.
 2. **wtype** (fallback for text the uinput map cannot produce, or when
    `output: wtype` is forced). Only ever spawned during an actual
    correction, never per keystroke, and never on the reader goroutines.
