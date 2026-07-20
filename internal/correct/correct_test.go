@@ -447,7 +447,35 @@ func TestUndoThenDeleteAndRetypeAtWordStart(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		d.key(evdev.KEY_BACKSPACE)
 	}
+	// Suppression from undo persists until a trusted boundary.
+	expectNoPlan(t, d.typeString("zolw "))
 	expectPlan(t, d.typeString("zolw "), 4, "żółw")
+}
+
+func TestSuppressionSurvivesTempCharDelete(t *testing.T) {
+	// Backspace into unobserved text, type a throwaway letter, delete it —
+	// still untrusted; must not correct the next word until a clean boundary.
+	d := newDriver(t, DefaultOptions())
+	d.key(evdev.KEY_BACKSPACE)
+	d.typeString("a")
+	d.key(evdev.KEY_BACKSPACE)
+	expectNoPlan(t, d.typeString("zolw "))
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
+}
+
+func TestSeparatorRepeatDoesNotCancelPending(t *testing.T) {
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	if r := d.send(evdev.KEY_SPACE, 1); r.Plan != nil {
+		t.Fatal("plan on Space down")
+	}
+	if r := d.send(evdev.KEY_SPACE, 2); r.Plan != nil { // autorepeat
+		t.Fatal("plan on Space repeat")
+	}
+	r := d.send(evdev.KEY_SPACE, 0)
+	if r.Plan == nil || r.Plan.Type != "żółw" {
+		t.Fatalf("plan on Space release after repeat = %+v", r.Plan)
+	}
 }
 
 func TestUndoOnlyImmediately(t *testing.T) {

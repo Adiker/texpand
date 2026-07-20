@@ -152,7 +152,9 @@ func (u *Uinput) Type(text string) error {
 				return fmt.Errorf("%w: shift up: %v", ErrOutputMayBePartial, err)
 			}
 		}
-		time.Sleep(5 * time.Millisecond)
+		if shift || rk.AltGr {
+			time.Sleep(5 * time.Millisecond)
+		}
 	}
 	return nil
 }

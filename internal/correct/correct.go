@@ -289,6 +289,12 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		return Result{}
 	}
 
+	// Autorepeat of the gating separator must not cancel the deferred plan;
+	// only a different key-down means the text moved on.
+	if ev.Value == 2 && c.pending != nil && c.heldSep != 0 && ev.Code == c.heldSep {
+		return Result{}
+	}
+
 	// Any key-down before a deferred plan could run: the text has moved
 	// past the separator, so the pending correction no longer applies.
 	c.clearPending()
@@ -339,12 +345,10 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		c.undo.active = false
 		if len(c.buf) > 0 {
 			c.buf = c.buf[:len(c.buf)-1]
-			// The user deleted the whole word we were tracking. A new word
-			// now starts a clean context; keep suppression only when the
-			// Backspace deleted into text we never observed.
-			if len(c.buf) == 0 {
-				c.suppressed = false
-			}
+			// Do not clear suppressed here: emptying a temporary typed token
+			// can leave the cursor back in text we never observed (e.g.
+			// Backspace into existing text, type a letter, delete it).
+			// Suppression lifts on a real boundary or Reset/openers.
 		} else {
 			// Deleting into text we did not observe.
 			c.suppressed = true
