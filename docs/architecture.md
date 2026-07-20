@@ -181,11 +181,11 @@ Hyphens and apostrophes join the token but mark it impure, so
 `biało-czerwony` typed as `bialo-czerwony` and `O'Brien` are never touched.
 Opening brackets/quotes reset the buffer, so `"zolw"` and `(zolw)` still
 correct the inner word. Space/punctuation corrections are deferred until the
-separator key is released, then delete and retype the word plus separator.
-That avoids both the fast-typing race of correcting on key-down and the
-Wayland quirk where arrow keys are ignored while Space is still held (or
-still releasing in the compositor). Opt-in Enter/Tab correction may still
-run on key-down when no deferral gate applies.
+separator key is released, then move left, replace only the word, and move
+back (`PreserveSuffix`) so a fast following keystroke cannot race a
+delete/retype of the separator. A short settle delay before Left covers the
+compositor still releasing the physical key. Opt-in Enter/Tab correction may
+still run on key-down when no deferral gate applies.
 
 ## Case preservation
 

@@ -127,13 +127,11 @@ type Corrector struct {
 	undo    undoState
 	candBuf []string
 
-	// pending holds a correction that must not run yet. Two gates keep it
-	// deferred: output-altering modifiers (Shift/AltGr — compositors merge
-	// them across keyboards) and the separator key itself. PreserveSuffix
-	// edits move Left before the already-typed separator; that arrow is
-	// ignored by many toolkits while Space/punctuation is still held, so
-	// the plan is released only after the separator key-up (and modifier
-	// release). Any intervening key-down drops the pending plan.
+	// pending holds a correction that must not run yet. Gates: the separator
+	// key still down (Left while held is ignored), Shift/AltGr (compositors
+	// merge them into virtual typing), and Ctrl/Alt/Meta (Backspace would
+	// become a shortcut). Released on separator/modifier key-up; any other
+	// key-down drops the plan.
 	pending     *Plan
 	pendingUndo undoState
 	heldSep     evdev.EvCode // non-zero while the gating separator is down
@@ -216,9 +214,12 @@ func (c *Corrector) clearWord() {
 }
 
 // maybeReleasePending emits a deferred correction once the separator key
-// and every output-altering modifier (Shift, AltGr) have been released.
+// and every dangerous modifier have been released. Shift/AltGr would garble
+// virtual typing; Ctrl/Alt/Meta would turn Backspace into a shortcut.
 func (c *Corrector) maybeReleasePending() Result {
-	if c.pending == nil || c.heldSep != 0 || c.modifiers.Shift || c.modifiers.AltGr {
+	if c.pending == nil || c.heldSep != 0 ||
+		c.modifiers.Shift || c.modifiers.AltGr ||
+		c.modifiers.Ctrl || c.modifiers.Alt || c.modifiers.Meta {
 		return Result{}
 	}
 	plan := c.pending
@@ -260,12 +261,23 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
 		return c.maybeReleasePending()
 	case evdev.KEY_LEFTCTRL, evdev.KEY_RIGHTCTRL:
+		// A shortcut chord: drop any deferred correction so releasing Space
+		// cannot emit Backspaces under Ctrl (Ctrl+Backspace deletes a word).
+		if ev.Value != 0 {
+			c.clearPending()
+		}
 		return Result{}
 	case evdev.KEY_LEFTALT:
+		if ev.Value != 0 {
+			c.clearPending()
+		}
 		return Result{}
 	case evdev.KEY_RIGHTALT: // AltGr on the Polish Programmer layout
 		return c.maybeReleasePending()
 	case evdev.KEY_LEFTMETA, evdev.KEY_RIGHTMETA:
+		if ev.Value != 0 {
+			c.clearPending()
+		}
 		return Result{}
 	}
 
@@ -480,17 +492,17 @@ func (c *Corrector) commitWord(correctHere bool, sep rune, sepCode evdev.EvCode)
 		return Result{}
 	}
 
-	// Space/punctuation are already on screen. We still include the separator
-	// in the delete/retype plan: PreserveSuffix (Left before the separator)
-	// is unreliable because texpand reads Space key-up from evdev before the
-	// compositor finishes releasing it, so the arrow is ignored and
-	// backspaces eat the separator. Emitting only after separator key-up
-	// keeps subsequent keystrokes queued behind the edit, so retyping the
-	// separator no longer races with fast typing.
-	plan := &Plan{
-		Backspaces: len(word) + 1,
-		Type:       cased + string(sep),
-		Restore:    typed + string(sep),
+	// Space/punctuation are already on screen. Keep the separator in place
+	// (PreserveSuffix): deleting and retyping it races with the next physical
+	// keystroke while Apply runs (AltGr sleeps make that window wider). Left
+	// before the separator is only safe after the separator key is released
+	// (and after a short Writer settle delay for the compositor).
+	keepSeparator := sep != '\n' && sep != '\t'
+	plan := &Plan{Backspaces: len(word), Type: cased, Restore: typed, PreserveSuffix: keepSeparator}
+	if !keepSeparator {
+		plan.Backspaces++
+		plan.Type += string(sep)
+		plan.Restore += string(sep)
 	}
 	var undo undoState
 	if c.opts.Undo {
@@ -499,7 +511,7 @@ func (c *Corrector) commitWord(correctHere bool, sep rune, sepCode evdev.EvCode)
 	// Defer until the separator key is released (and Shift/AltGr are up).
 	// Enter/Tab also wait when a modifier is held so virtual typing is not
 	// altered by merged compositor modifier state.
-	deferForSep := sep != '\n' && sep != '\t'
+	deferForSep := keepSeparator
 	if deferForSep || c.modifiers.Shift || c.modifiers.AltGr {
 		c.pending = plan
 		c.pendingUndo = undo

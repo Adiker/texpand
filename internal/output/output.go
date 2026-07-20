@@ -363,6 +363,10 @@ func (w *Writer) Apply(edit Edit) error {
 	// application. Move before it, replace only the word, then move back so
 	// the separator is preserved instead of being retyped asynchronously.
 	if edit.PreserveSuffix {
+		// evdev delivers key-up to texpand before the compositor finishes
+		// releasing the physical separator; Left while it is still held is
+		// ignored and backspaces then eat the separator.
+		time.Sleep(10 * time.Millisecond)
 		if emitted, err := keyStroke(w.Kbd, uinput.KeyLeft); err != nil {
 			return fmt.Errorf("move before preserved suffix: %w", err)
 		} else if !emitted {
