@@ -120,6 +120,11 @@ func (u *Uinput) Type(text string) error {
 				return fail(fmt.Errorf("altgr down: %w", err))
 			}
 		}
+		// Compositors reorder or drop ultra-fast AltGr chords from virtual
+		// keyboards; a short gap keeps diacritics in typing order.
+		if shift || rk.AltGr {
+			time.Sleep(5 * time.Millisecond)
+		}
 		keyEmitted, err := keyStroke(u.Kbd, rk.Code)
 		if keyEmitted {
 			emitted++
@@ -134,6 +139,7 @@ func (u *Uinput) Type(text string) error {
 			return fail(fmt.Errorf("key %d: %w", rk.Code, err))
 		}
 		if rk.AltGr {
+			time.Sleep(5 * time.Millisecond)
 			if err := u.Kbd.KeyUp(uinput.KeyRightalt); err != nil {
 				if shift {
 					_ = u.Kbd.KeyUp(uinput.KeyLeftshift)
@@ -146,6 +152,7 @@ func (u *Uinput) Type(text string) error {
 				return fmt.Errorf("%w: shift up: %v", ErrOutputMayBePartial, err)
 			}
 		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	return nil
 }

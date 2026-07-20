@@ -18,11 +18,12 @@ import (
 // physical keystrokes and the daemon's virtual-keyboard output, applying
 // the Polish Programmer layout. It implements output.Keyboard.
 type screen struct {
-	text   []rune
-	cursor int
-	shift  int
-	altgr  int
-	caps   bool
+	text      []rune
+	cursor    int
+	shift     int
+	altgr     int
+	caps      bool
+	spaceHeld int // physical Space still down — models toolkits that ignore arrows then
 }
 
 func (s *screen) insert(runes ...rune) {
@@ -72,11 +73,20 @@ func (s *screen) KeyPress(k int) error {
 		}
 		return nil
 	case uinput.KeyLeft:
+		// Many Wayland clients ignore arrow keys while Space is still held.
+		// Correcting on Space key-down therefore moves Left into a no-op and
+		// backspaces eat the separator — deferral until key-up avoids that.
+		if s.spaceHeld > 0 {
+			return nil
+		}
 		if s.cursor > 0 {
 			s.cursor--
 		}
 		return nil
 	case uinput.KeyRight:
+		if s.spaceHeld > 0 {
+			return nil
+		}
 		if s.cursor < len(s.text) {
 			s.cursor++
 		}
@@ -155,6 +165,13 @@ func newRig(t *testing.T, opts correct.Options) *rig {
 // the physical key first (the daemon never delays real input), then the
 // corrector reacts, possibly rewriting the screen through the writer.
 func (r *rig) event(code evdev.EvCode, value int32) {
+	if code == evdev.KEY_SPACE {
+		if value >= 1 {
+			r.scr.spaceHeld++
+		} else if r.scr.spaceHeld > 0 {
+			r.scr.spaceHeld--
+		}
+	}
 	if value >= 1 {
 		r.scr.KeyPress(int(code))
 	}
@@ -239,6 +256,16 @@ func TestEndToEndCorrection(t *testing.T) {
 		r.typeString(c.typed)
 		r.expect(c.want)
 	}
+}
+
+func TestEndToEndTwoCorrectionsInSameField(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.typeString("zolw ")
+	r.expect("żółw ")
+	r.typeString("zolw ")
+	r.expect("żółw żółw ")
+	r.typeString("zrodlo ")
+	r.expect("żółw żółw źródło ")
 }
 
 func TestEndToEndUndo(t *testing.T) {

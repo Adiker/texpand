@@ -180,10 +180,12 @@ conservative". Both can be enabled in config.
 Hyphens and apostrophes join the token but mark it impure, so
 `biało-czerwony` typed as `bialo-czerwony` and `O'Brien` are never touched.
 Opening brackets/quotes reset the buffer, so `"zolw"` and `(zolw)` still
-correct the inner word. For Space and punctuation, the replacement moves
-before the already-typed separator, replaces only the word, and moves back;
-this preserves the separator during fast typing. Opt-in Enter/Tab correction
-still re-types the separator because those keys can submit or move focus.
+correct the inner word. Space/punctuation corrections are deferred until the
+separator key is released, then delete and retype the word plus separator.
+That avoids both the fast-typing race of correcting on key-down and the
+Wayland quirk where arrow keys are ignored while Space is still held (or
+still releasing in the compositor). Opt-in Enter/Tab correction may still
+run on key-down when no deferral gate applies.
 
 ## Case preservation
 
@@ -209,7 +211,9 @@ emit Shift, so `ZOLW` typed with Caps Lock also outputs uppercase correctly.
 1. **uinput / Polish Programmer** (primary): ASCII via the US reverse map,
    Polish diacritics via AltGr(+Shift) combinations (`ż`=AltGr+Z,
    `ź`=AltGr+X, …). Fastest path, no subprocess, works because KDE applies
-   the user's layout to the virtual keyboard.
+   the user's layout to the virtual keyboard. Short sleeps between AltGr
+   chords are required — without them compositors reorder or drop the
+   diacritic keys (e.g. `żółw` arriving as `w żó…`).
 2. **wtype** (fallback for text the uinput map cannot produce, or when
    `output: wtype` is forced). Only ever spawned during an actual
    correction, never per keystroke, and never on the reader goroutines.
