@@ -180,8 +180,10 @@ conservative". Both can be enabled in config.
 Hyphens and apostrophes join the token but mark it impure, so
 `biało-czerwony` typed as `bialo-czerwony` and `O'Brien` are never touched.
 Opening brackets/quotes reset the buffer, so `"zolw"` and `(zolw)` still
-correct the inner word. The replacement always re-types the exact separator
-character that triggered it.
+correct the inner word. For Space and punctuation, the replacement moves
+before the already-typed separator, replaces only the word, and moves back;
+this preserves the separator during fast typing. Opt-in Enter/Tab correction
+still re-types the separator because those keys can submit or move focus.
 
 ## Case preservation
 

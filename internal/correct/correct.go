@@ -37,6 +37,9 @@ type Plan struct {
 	Backspaces int
 	Type       string
 	Restore    string
+	// PreserveSuffix keeps the already-typed separator after the replacement.
+	// The writer moves left before deleting the word and right afterwards.
+	PreserveSuffix bool
 }
 
 // Result is what handling one event produced.
@@ -312,6 +315,12 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		c.undo.active = false
 		if len(c.buf) > 0 {
 			c.buf = c.buf[:len(c.buf)-1]
+			// The user deleted the whole word we were tracking. A new word
+			// now starts a clean context; keep suppression only when the
+			// Backspace deleted into text we never observed.
+			if len(c.buf) == 0 {
+				c.suppressed = false
+			}
 		} else {
 			// Deleting into text we did not observe.
 			c.suppressed = true
@@ -459,10 +468,17 @@ func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
 		return Result{}
 	}
 
-	plan := &Plan{
-		Backspaces: len(word) + 1, // the word plus the separator
-		Type:       cased + string(sep),
-		Restore:    typed + string(sep),
+	// Space and punctuation have already been delivered to the application by
+	// the time this plan is created. Keep that separator in place: deleting and
+	// retyping it creates a race with fast subsequent keystrokes and can make a
+	// space disappear. Enter/Tab are special because they may submit or move
+	// focus, so their opt-in correction keeps the old delete-and-retype flow.
+	keepSeparator := sep != '\n' && sep != '\t'
+	plan := &Plan{Backspaces: len(word), Type: cased, Restore: typed, PreserveSuffix: keepSeparator}
+	if !keepSeparator {
+		plan.Backspaces++
+		plan.Type += string(sep)
+		plan.Restore += string(sep)
 	}
 	var undo undoState
 	if c.opts.Undo {
