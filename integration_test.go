@@ -27,7 +27,7 @@ type screen struct {
 }
 
 func (s *screen) insert(runes ...rune) {
-	s.text = append(s.text, 0)
+	s.text = append(s.text, make([]rune, len(runes))...)
 	copy(s.text[s.cursor+len(runes):], s.text[s.cursor:len(s.text)-len(runes)])
 	copy(s.text[s.cursor:], runes)
 	s.cursor += len(runes)
