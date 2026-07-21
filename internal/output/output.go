@@ -65,9 +65,10 @@ type Backend interface {
 // Edit describes one replacement at the cursor. Restore must be the exact
 // text covered by Backspaces so it can be put back after a safe failure.
 type Edit struct {
-	Backspaces int
-	Text       string
-	Restore    string
+	Backspaces     int
+	Text           string
+	Restore        string
+	PreserveSuffix bool // keep the already-typed character immediately after the edit
 }
 
 // Uinput types text through virtual key events, using AltGr combinations
@@ -119,6 +120,11 @@ func (u *Uinput) Type(text string) error {
 				return fail(fmt.Errorf("altgr down: %w", err))
 			}
 		}
+		// Compositors reorder or drop ultra-fast AltGr chords from virtual
+		// keyboards; a short gap keeps diacritics in typing order.
+		if shift || rk.AltGr {
+			time.Sleep(5 * time.Millisecond)
+		}
 		keyEmitted, err := keyStroke(u.Kbd, rk.Code)
 		if keyEmitted {
 			emitted++
@@ -133,6 +139,7 @@ func (u *Uinput) Type(text string) error {
 			return fail(fmt.Errorf("key %d: %w", rk.Code, err))
 		}
 		if rk.AltGr {
+			time.Sleep(5 * time.Millisecond)
 			if err := u.Kbd.KeyUp(uinput.KeyRightalt); err != nil {
 				if shift {
 					_ = u.Kbd.KeyUp(uinput.KeyLeftshift)
@@ -144,6 +151,9 @@ func (u *Uinput) Type(text string) error {
 			if err := u.Kbd.KeyUp(uinput.KeyLeftshift); err != nil {
 				return fmt.Errorf("%w: shift up: %v", ErrOutputMayBePartial, err)
 			}
+		}
+		if shift || rk.AltGr {
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 	return nil
@@ -351,6 +361,33 @@ func (w *Writer) Apply(edit Edit) error {
 		return lastErr
 	}
 
+	// For word-boundary corrections the separator is already in the focused
+	// application. Move before it, replace only the word, then move back so
+	// the separator is preserved instead of being retyped asynchronously.
+	if edit.PreserveSuffix {
+		// evdev delivers key-up to texpand before the compositor finishes
+		// releasing the physical separator; Left while it is still held is
+		// ignored and backspaces then eat the separator.
+		time.Sleep(10 * time.Millisecond)
+		if emitted, err := keyStroke(w.Kbd, uinput.KeyLeft); err != nil {
+			return fmt.Errorf("move before preserved suffix: %w", err)
+		} else if !emitted {
+			return fmt.Errorf("move before preserved suffix: no key event emitted")
+		}
+	}
+
+	moveAfter := func(operationErr error) error {
+		if !edit.PreserveSuffix {
+			return operationErr
+		}
+		if emitted, err := keyStroke(w.Kbd, uinput.KeyRight); err != nil {
+			return errors.Join(operationErr, fmt.Errorf("restore cursor after preserved suffix: %w", err))
+		} else if !emitted {
+			return errors.Join(operationErr, errors.New("restore cursor after preserved suffix: no key event emitted"))
+		}
+		return operationErr
+	}
+
 	deleted := 0
 	for deleted < edit.Backspaces {
 		emitted, err := keyStroke(w.Kbd, uinput.KeyBackspace)
@@ -359,19 +396,19 @@ func (w *Writer) Apply(edit Edit) error {
 		}
 		if err != nil {
 			if emitted {
-				return fmt.Errorf("%w: backspace %d/%d: %v", ErrOutputMayBePartial, deleted, edit.Backspaces, err)
+				return moveAfter(fmt.Errorf("%w: backspace %d/%d: %v", ErrOutputMayBePartial, deleted, edit.Backspaces, err))
 			}
 			restore := lastRunes(edit.Restore, deleted)
-			return w.withRestore(fmt.Errorf("backspace %d/%d: %w", deleted+1, edit.Backspaces, err), restore)
+			return moveAfter(w.withRestore(fmt.Errorf("backspace %d/%d: %w", deleted+1, edit.Backspaces, err), restore))
 		}
 	}
 	if err := selected.Type(edit.Text); err != nil {
 		if errors.Is(err, ErrOutputMayBePartial) {
-			return fmt.Errorf("output backend %s: %w", selected.Name(), err)
+			return moveAfter(fmt.Errorf("output backend %s: %w", selected.Name(), err))
 		}
-		return w.withRestore(fmt.Errorf("output backend %s: %w", selected.Name(), err), edit.Restore)
+		return moveAfter(w.withRestore(fmt.Errorf("output backend %s: %w", selected.Name(), err), edit.Restore))
 	}
-	return nil
+	return moveAfter(nil)
 }
 
 func lastRunes(s string, n int) string {

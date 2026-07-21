@@ -238,8 +238,13 @@ func run() error {
 				fmt.Printf("texpand: autocorrect %s (keyboard shortcut)\n", onOff(enabled))
 			}
 			if res.Plan != nil {
-				dbgUnsafe("correction: -%d chars, +%q (undo=%v)", res.Plan.Backspaces, res.Plan.Type, res.Undo)
-				edit := output.Edit{Backspaces: res.Plan.Backspaces, Text: res.Plan.Type, Restore: res.Plan.Restore}
+				dbgUnsafe("correction: -%d chars, +%q (undo=%v preserve=%v)", res.Plan.Backspaces, res.Plan.Type, res.Undo, res.Plan.PreserveSuffix)
+				edit := output.Edit{
+					Backspaces:     res.Plan.Backspaces,
+					Text:           res.Plan.Type,
+					Restore:        res.Plan.Restore,
+					PreserveSuffix: res.Plan.PreserveSuffix,
+				}
 				if err := ac.writer.Apply(edit); err != nil {
 					fmt.Fprintf(os.Stderr, "texpand: correction output failed: %v\n", err)
 					// The corrector prepared undo state before output ran. It is

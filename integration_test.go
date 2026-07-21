@@ -18,10 +18,19 @@ import (
 // physical keystrokes and the daemon's virtual-keyboard output, applying
 // the Polish Programmer layout. It implements output.Keyboard.
 type screen struct {
-	text  []rune
-	shift int
-	altgr int
-	caps  bool
+	text      []rune
+	cursor    int
+	shift     int
+	altgr     int
+	caps      bool
+	spaceHeld int // physical Space still down — models toolkits that ignore arrows then
+}
+
+func (s *screen) insert(runes ...rune) {
+	s.text = append(s.text, make([]rune, len(runes))...)
+	copy(s.text[s.cursor+len(runes):], s.text[s.cursor:len(s.text)-len(runes)])
+	copy(s.text[s.cursor:], runes)
+	s.cursor += len(runes)
 }
 
 func (s *screen) KeyDown(k int) error {
@@ -57,15 +66,36 @@ func (s *screen) KeyPress(k int) error {
 		s.caps = !s.caps
 		return nil
 	case evdev.KEY_BACKSPACE:
-		if len(s.text) > 0 {
+		if s.cursor > 0 {
+			copy(s.text[s.cursor-1:], s.text[s.cursor:])
 			s.text = s.text[:len(s.text)-1]
+			s.cursor--
+		}
+		return nil
+	case uinput.KeyLeft:
+		// Many Wayland clients ignore arrow keys while Space is still held.
+		// Correcting on Space key-down therefore moves Left into a no-op and
+		// backspaces eat the separator — deferral until key-up avoids that.
+		if s.spaceHeld > 0 {
+			return nil
+		}
+		if s.cursor > 0 {
+			s.cursor--
+		}
+		return nil
+	case uinput.KeyRight:
+		if s.spaceHeld > 0 {
+			return nil
+		}
+		if s.cursor < len(s.text) {
+			s.cursor++
 		}
 		return nil
 	case evdev.KEY_ENTER, evdev.KEY_KPENTER:
-		s.text = append(s.text, '\n')
+		s.insert('\n')
 		return nil
 	case evdev.KEY_TAB:
-		s.text = append(s.text, '\t')
+		s.insert('\t')
 		return nil
 	}
 	if s.altgr > 0 {
@@ -73,7 +103,7 @@ func (s *screen) KeyPress(k int) error {
 			if (s.shift > 0) != s.caps {
 				r = []rune(strings.ToUpper(string(r)))[0]
 			}
-			s.text = append(s.text, r)
+			s.insert(r)
 		}
 		return nil
 	}
@@ -86,7 +116,7 @@ func (s *screen) KeyPress(k int) error {
 		if useShift {
 			ch = kc.Shifted
 		}
-		s.text = append(s.text, []rune(ch)...)
+		s.insert([]rune(ch)...)
 	}
 	return nil
 }
@@ -135,6 +165,13 @@ func newRig(t *testing.T, opts correct.Options) *rig {
 // the physical key first (the daemon never delays real input), then the
 // corrector reacts, possibly rewriting the screen through the writer.
 func (r *rig) event(code evdev.EvCode, value int32) {
+	if code == evdev.KEY_SPACE {
+		if value >= 1 {
+			r.scr.spaceHeld++
+		} else if r.scr.spaceHeld > 0 {
+			r.scr.spaceHeld--
+		}
+	}
 	if value >= 1 {
 		r.scr.KeyPress(int(code))
 	}
@@ -155,7 +192,12 @@ func (r *rig) event(code evdev.EvCode, value int32) {
 	mods := r.tracker.Handle("kbd", code, value)
 	res := r.corrector.HandleEvent(correct.KeyEvent{Code: code, Value: value, Modifiers: mods})
 	if res.Plan != nil {
-		edit := output.Edit{Backspaces: res.Plan.Backspaces, Text: res.Plan.Type, Restore: res.Plan.Restore}
+		edit := output.Edit{
+			Backspaces:     res.Plan.Backspaces,
+			Text:           res.Plan.Type,
+			Restore:        res.Plan.Restore,
+			PreserveSuffix: res.Plan.PreserveSuffix,
+		}
 		if err := r.writer.Apply(edit); err != nil {
 			r.t.Fatalf("writer: %v", err)
 		}
@@ -214,6 +256,16 @@ func TestEndToEndCorrection(t *testing.T) {
 		r.typeString(c.typed)
 		r.expect(c.want)
 	}
+}
+
+func TestEndToEndTwoCorrectionsInSameField(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.typeString("zolw ")
+	r.expect("żółw ")
+	r.typeString("zolw ")
+	r.expect("żółw żółw ")
+	r.typeString("zrodlo ")
+	r.expect("żółw żółw źródło ")
 }
 
 func TestEndToEndUndo(t *testing.T) {

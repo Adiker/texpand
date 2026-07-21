@@ -66,6 +66,10 @@ func keyName(k int) string {
 		return "v"
 	case int(evdev.KEY_SPACE):
 		return "space"
+	case uinput.KeyLeft:
+		return "left"
+	case uinput.KeyRight:
+		return "right"
 	default:
 		return "?"
 	}
@@ -160,6 +164,23 @@ func TestWriterFallbackChain(t *testing.T) {
 	}
 	if !slices.Equal(second.typed, []string{"żółw"}) {
 		t.Fatalf("second backend got %v", second.typed)
+	}
+}
+
+func TestWriterPreservesSuffixAroundReplacement(t *testing.T) {
+	kbd := &fakeKbd{}
+	w := &Writer{Kbd: kbd, Backends: []Backend{&Uinput{Kbd: kbd}}}
+	if err := w.Apply(Edit{Backspaces: 3, Text: "x", Restore: "abc", PreserveSuffix: true}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"down:left", "up:left",
+		"down:bs", "up:bs", "down:bs", "up:bs", "down:bs", "up:bs",
+		"down:x", "up:x",
+		"down:right", "up:right",
+	}
+	if !slices.Equal(kbd.log, want) {
+		t.Fatalf("log = %v\nwant  %v", kbd.log, want)
 	}
 }
 

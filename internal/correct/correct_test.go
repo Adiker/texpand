@@ -122,14 +122,14 @@ func expectNoPlan(t *testing.T, results []Result) {
 
 func TestBasicCorrection(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
 func TestPunctuationSeparators(t *testing.T) {
 	for _, sep := range []string{".", ",", "!", "?", ":", ";", ")", "]", "}", "\""} {
 		d := newDriver(t, DefaultOptions())
 		res := d.typeString("zrodlo" + sep)
-		expectPlan(t, res, 7, "źródło"+sep)
+		expectPlan(t, res, 6, "źródło")
 	}
 }
 
@@ -156,7 +156,7 @@ func TestCasePreservation(t *testing.T) {
 	for _, c := range cases {
 		d := newDriver(t, DefaultOptions())
 		res := d.typeString(c.in)
-		expectPlan(t, res, len([]rune(c.in)), c.out)
+		expectPlan(t, res, len([]rune(c.in))-1, string([]rune(c.out)[:len([]rune(c.out))-1]))
 	}
 }
 
@@ -172,14 +172,14 @@ func TestCapsLockUppercase(t *testing.T) {
 	d.key(evdev.KEY_CAPSLOCK)
 	// With Caps Lock on, plain letters are uppercase on screen.
 	res := d.typeString("zolw ")
-	expectPlan(t, res, 5, "ŻÓŁW ")
+	expectPlan(t, res, 4, "ŻÓŁW")
 }
 
 func TestCapsLockSeededFromLED(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	d.tracker.SetCaps(true)
 	res := d.typeString("zolw ")
-	expectPlan(t, res, 5, "ŻÓŁW ")
+	expectPlan(t, res, 4, "ŻÓŁW")
 }
 
 func TestAltGrDiacriticsDisableCorrection(t *testing.T) {
@@ -194,7 +194,7 @@ func TestAltGrDiacriticsDisableCorrection(t *testing.T) {
 func TestMinWordLength(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	// "sa" (len 2) corrects with default min 2...
-	expectPlan(t, d.typeString("sa "), 3, "są ")
+	expectPlan(t, d.typeString("sa "), 2, "są")
 	// ...but not with min 3.
 	opts := DefaultOptions()
 	opts.MinWordLength = 3
@@ -217,10 +217,10 @@ func TestHyphenatedCompoundUntouched(t *testing.T) {
 func TestOpenersStartFreshWord(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	res := d.typeString("(zolw)")
-	expectPlan(t, res, 5, "żółw)")
+	expectPlan(t, res, 4, "żółw")
 	d = newDriver(t, DefaultOptions())
 	res = d.typeString("\"zolw\"")
-	expectPlan(t, res, 5, "żółw\"")
+	expectPlan(t, res, 4, "żółw")
 }
 
 func TestBackspaceEditing(t *testing.T) {
@@ -228,7 +228,7 @@ func TestBackspaceEditing(t *testing.T) {
 	d.typeString("zolwx")
 	d.key(evdev.KEY_BACKSPACE)
 	res := d.typeString(" ")
-	expectPlan(t, res, 5, "żółw ")
+	expectPlan(t, res, 4, "żółw")
 }
 
 func TestBackspaceIntoUnknownTextSuppresses(t *testing.T) {
@@ -237,7 +237,7 @@ func TestBackspaceIntoUnknownTextSuppresses(t *testing.T) {
 	d.key(evdev.KEY_BACKSPACE)
 	expectNoPlan(t, d.typeString("zolw "))
 	// The word after that clean boundary corrects again.
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
 func TestCursorMovementInvalidates(t *testing.T) {
@@ -297,7 +297,7 @@ func TestEnterAndTabDefaultCommitWithoutCorrecting(t *testing.T) {
 		t.Fatal("enter corrected by default")
 	}
 	// The boundary still commits: next word corrects normally.
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 
 	d = newDriver(t, DefaultOptions())
 	d.typeString("zolw")
@@ -329,7 +329,7 @@ func TestShiftedSeparatorDefersUntilShiftRelease(t *testing.T) {
 	}
 	d.send(evdev.KEY_1, 0)
 	r := d.send(evdev.KEY_LEFTSHIFT, 0)
-	if r.Plan == nil || r.Plan.Type != "żółw!" {
+	if r.Plan == nil || r.Plan.Type != "żółw" {
 		t.Fatalf("plan on shift release = %+v", r.Plan)
 	}
 }
@@ -345,7 +345,7 @@ func TestDeferredCorrectionWaitsForShiftOnEveryKeyboard(t *testing.T) {
 		t.Fatalf("plan emitted while second keyboard still held Shift: %+v", r.Plan)
 	}
 	r := d.sendDevice("kbd-b", evdev.KEY_RIGHTSHIFT, 0)
-	if r.Plan == nil || r.Plan.Type != "żółw!" {
+	if r.Plan == nil || r.Plan.Type != "żółw" {
 		t.Fatalf("plan after final Shift release = %+v", r.Plan)
 	}
 }
@@ -361,9 +361,34 @@ func TestAltGrHeldDefersCorrection(t *testing.T) {
 	}
 	d.send(evdev.KEY_SPACE, 0)
 	r := d.send(evdev.KEY_RIGHTALT, 0)
-	if r.Plan == nil || r.Plan.Type != "żółw " {
+	if r.Plan == nil || r.Plan.Type != "żółw" {
 		t.Fatalf("plan on AltGr release = %+v", r.Plan)
 	}
+}
+
+func TestSeparatorCorrectionDefersUntilKeyUp(t *testing.T) {
+	// Correction runs on separator key-up so Left (PreserveSuffix) is not
+	// ignored while Space is still held.
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	if r := d.send(evdev.KEY_SPACE, 1); r.Plan != nil {
+		t.Fatal("plan emitted while Space held")
+	}
+	r := d.send(evdev.KEY_SPACE, 0)
+	if r.Plan == nil || r.Plan.Type != "żółw" || r.Plan.Backspaces != 4 || !r.Plan.PreserveSuffix {
+		t.Fatalf("plan on Space release = %+v", r.Plan)
+	}
+}
+
+func TestPendingCancelledByCtrlBeforeSeparatorRelease(t *testing.T) {
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	d.send(evdev.KEY_SPACE, 1)
+	d.send(evdev.KEY_LEFTCTRL, 1) // cancels deferred correction
+	if r := d.send(evdev.KEY_SPACE, 0); r.Plan != nil {
+		t.Fatalf("plan emitted after Ctrl cancelled pending: %+v", r.Plan)
+	}
+	d.send(evdev.KEY_LEFTCTRL, 0)
 }
 
 func TestPendingPlanCancelledByNextKey(t *testing.T) {
@@ -384,7 +409,7 @@ func TestPendingPlanCancelledByNextKey(t *testing.T) {
 
 func TestUndo(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 
 	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan == nil || !r.Undo {
@@ -400,23 +425,67 @@ func TestUndo(t *testing.T) {
 	// The restored word must not be re-corrected at the next boundary.
 	expectNoPlan(t, d.typeString(" "))
 	// But the word after it corrects again.
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
 func TestUndoPreservesCase(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
-	expectPlan(t, d.typeString("Zolw!"), 5, "Żółw!")
+	expectPlan(t, d.typeString("Zolw!"), 4, "Żółw")
 	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan == nil || r.Plan.Type != "Zolw" {
 		t.Fatalf("undo plan = %+v", r.Plan)
 	}
 }
 
+func TestUndoThenDeleteAndRetypeAtWordStart(t *testing.T) {
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw ")
+	if r := d.send(evdev.KEY_BACKSPACE, 1); r.Plan == nil || !r.Undo {
+		t.Fatalf("undo plan = %+v", r.Plan)
+	}
+	d.send(evdev.KEY_BACKSPACE, 0)
+	for i := 0; i < 4; i++ {
+		d.key(evdev.KEY_BACKSPACE)
+	}
+	// Suppression from undo persists until a trusted boundary.
+	expectNoPlan(t, d.typeString("zolw "))
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
+}
+
+func TestSuppressionSurvivesTempCharDelete(t *testing.T) {
+	// Backspace into unobserved text, type a throwaway letter, delete it —
+	// still untrusted; must not correct the next word until a clean boundary.
+	d := newDriver(t, DefaultOptions())
+	d.key(evdev.KEY_BACKSPACE)
+	d.typeString("a")
+	d.key(evdev.KEY_BACKSPACE)
+	expectNoPlan(t, d.typeString("zolw "))
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
+}
+
+func TestSeparatorRepeatCancelsPending(t *testing.T) {
+	// A held Space autorepeats into the app as extra separators. The deferred
+	// PreserveSuffix plan only accounts for one, so repeat must cancel it.
+	d := newDriver(t, DefaultOptions())
+	d.typeString("zolw")
+	if r := d.send(evdev.KEY_SPACE, 1); r.Plan != nil {
+		t.Fatal("plan on Space down")
+	}
+	if r := d.send(evdev.KEY_SPACE, 2); r.Plan != nil {
+		t.Fatal("plan on Space repeat")
+	}
+	if r := d.send(evdev.KEY_SPACE, 0); r.Plan != nil {
+		t.Fatalf("stale plan after Space repeat: %+v", r.Plan)
+	}
+	// After the cancelled boundary, a fresh word still corrects.
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
+}
+
 func TestUndoOnlyImmediately(t *testing.T) {
 	// Typing anything else commits the correction; Backspace then just
 	// deletes normally.
 	d := newDriver(t, DefaultOptions())
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 	d.typeString("a")
 	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan != nil {
@@ -426,7 +495,7 @@ func TestUndoOnlyImmediately(t *testing.T) {
 
 func TestSecondSeparatorCommits(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 	expectNoPlan(t, d.typeString(" ")) // second space: no new plan
 	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan != nil {
@@ -438,7 +507,7 @@ func TestUndoDisabled(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Undo = false
 	d := newDriver(t, opts)
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 	r := d.send(evdev.KEY_BACKSPACE, 1)
 	if r.Plan != nil {
 		t.Fatal("undo fired although disabled")
@@ -476,7 +545,7 @@ func TestDisabledDoesNothing(t *testing.T) {
 	d.c.SetEnabled(false)
 	expectNoPlan(t, d.typeString("zolw "))
 	d.c.SetEnabled(true)
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
 func TestExclusionCallback(t *testing.T) {
@@ -486,7 +555,7 @@ func TestExclusionCallback(t *testing.T) {
 	d := newDriver(t, opts)
 	expectNoPlan(t, d.typeString("zolw "))
 	excluded = false
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
 func TestNoLookupNoCorrection(t *testing.T) {
@@ -524,7 +593,7 @@ func TestResetClearsState(t *testing.T) {
 	d.c.Reset() // keyboard hotplug
 	d.tracker.Reset(false)
 	expectNoPlan(t, d.typeString("w "))
-	expectPlan(t, d.typeString("zolw "), 5, "żółw ")
+	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
 func TestInvalidateSuppressesCurrentWord(t *testing.T) {
