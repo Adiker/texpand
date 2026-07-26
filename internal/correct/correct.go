@@ -37,12 +37,20 @@ type Plan struct {
 	Backspaces int
 	Type       string
 	Restore    string
+	// SuffixRunes keeps already-typed text after the replacement. The writer
+	// moves left by this many runes before deleting the word and restores the
+	// cursor afterwards.
+	SuffixRunes int
 }
 
 // Result is what handling one event produced.
 type Result struct {
 	// Plan, if non-nil, is a correction (or undo) to execute.
 	Plan *Plan
+	// Settle asks the caller to start a short, non-blocking settle timer.
+	// Printable input renews the timer and extends the observed suffix;
+	// ReleasePending returns the plan once input settles.
+	Settle bool
 	// Toggled is true when the toggle shortcut was pressed; the caller
 	// flips the enabled state.
 	Toggled bool
@@ -124,13 +132,14 @@ type Corrector struct {
 	undo    undoState
 	candBuf []string
 
-	// pending holds a correction that fired while Shift was physically
-	// held (e.g. on '!'). Compositors merge modifier state across
-	// keyboards, so typing through the virtual keyboard now would come
-	// out uppercase; the plan is released when Shift goes up, or dropped
-	// if any other key intervenes.
+	// pending holds a correction that must not run yet. Gates: the separator
+	// key still down (Left while held is ignored), Shift/AltGr (compositors
+	// merge them into virtual typing), and Ctrl/Alt/Meta (Backspace would
+	// become a shortcut). Separator/modifier key-up starts a settle interval;
+	// printable key-downs extend the suffix, while unobservable edits drop it.
 	pending     *Plan
 	pendingUndo undoState
+	heldSep     evdev.EvCode // non-zero while the gating separator is down
 }
 
 // New creates a Corrector. The dictionary can be attached later with
@@ -185,7 +194,7 @@ func (c *Corrector) Reset() {
 	c.clearWord()
 	c.suppressed = false
 	c.undo.active = false
-	c.pending = nil
+	c.clearPending()
 	c.modifiers = inputstate.Modifiers{Caps: c.modifiers.Caps}
 }
 
@@ -195,7 +204,12 @@ func (c *Corrector) Invalidate() {
 	c.clearWord()
 	c.suppressed = true
 	c.undo.active = false
+	c.clearPending()
+}
+
+func (c *Corrector) clearPending() {
 	c.pending = nil
+	c.heldSep = 0
 }
 
 func (c *Corrector) clearWord() {
@@ -204,15 +218,45 @@ func (c *Corrector) clearWord() {
 	c.overflow = false
 }
 
-// maybeReleasePending emits a deferred correction once no output-altering
-// modifier (Shift, AltGr) is physically held anymore.
+func (c *Corrector) pendingBlocked() bool {
+	if c.pending == nil || c.heldSep != 0 ||
+		c.modifiers.Shift || c.modifiers.AltGr ||
+		c.modifiers.Ctrl || c.modifiers.Alt || c.modifiers.Meta {
+		return true
+	}
+	return false
+}
+
+// maybeReleasePending emits Enter/Tab corrections immediately once every
+// dangerous modifier is up. Suffix-preserving edits first ask the caller for
+// a non-blocking settle interval so following text can be counted.
 func (c *Corrector) maybeReleasePending() Result {
-	if c.pending == nil || c.modifiers.Shift || c.modifiers.AltGr {
+	if c.pendingBlocked() {
+		return Result{}
+	}
+	if c.pending.SuffixRunes > 0 {
+		return Result{Settle: true}
+	}
+	return c.ReleasePending()
+}
+
+// ReleasePending emits a correction after the caller's settle timer fires.
+// Printable input is preserved through SuffixRunes; shortcuts, navigation,
+// and Backspace clear pending before this method can return it.
+func (c *Corrector) ReleasePending() Result {
+	if c.pendingBlocked() {
 		return Result{}
 	}
 	plan := c.pending
 	c.pending = nil
-	c.undo = c.pendingUndo
+	if plan.SuffixRunes == 1 {
+		c.undo = c.pendingUndo
+	} else {
+		// Immediate Backspace only means "undo correction" while the cursor is
+		// directly after the one separator that triggered it. Once additional
+		// suffix text exists, Backspace edits that suffix instead.
+		c.undo.active = false
+	}
 	return Result{Plan: plan}
 }
 
@@ -249,25 +293,36 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	case evdev.KEY_LEFTSHIFT, evdev.KEY_RIGHTSHIFT:
 		return c.maybeReleasePending()
 	case evdev.KEY_LEFTCTRL, evdev.KEY_RIGHTCTRL:
+		// A shortcut chord: drop any deferred correction so releasing Space
+		// cannot emit Backspaces under Ctrl (Ctrl+Backspace deletes a word).
+		if ev.Value != 0 {
+			c.clearPending()
+		}
 		return Result{}
 	case evdev.KEY_LEFTALT:
+		if ev.Value != 0 {
+			c.clearPending()
+		}
 		return Result{}
 	case evdev.KEY_RIGHTALT: // AltGr on the Polish Programmer layout
 		return c.maybeReleasePending()
 	case evdev.KEY_LEFTMETA, evdev.KEY_RIGHTMETA:
+		if ev.Value != 0 {
+			c.clearPending()
+		}
 		return Result{}
 	}
 
 	if ev.Value == 0 {
+		if c.pending != nil && c.heldSep != 0 && ev.Code == c.heldSep {
+			c.heldSep = 0
+			return c.maybeReleasePending()
+		}
 		return Result{}
 	}
 
-	// Any key-down before Shift was released: the text has moved past the
-	// separator, so a pending correction no longer applies.
-	c.pending = nil
-
 	if ev.Code == evdev.KEY_CAPSLOCK {
-		return Result{}
+		return c.maybeReleasePending()
 	}
 
 	// The toggle shortcut works even while disabled.
@@ -279,6 +334,7 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	}
 
 	if !c.enabled.Load() {
+		c.clearPending()
 		if len(c.buf) > 0 || c.suppressed || c.undo.active {
 			c.clearWord()
 			c.suppressed = false
@@ -287,10 +343,25 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		return Result{}
 	}
 
+	kc, hasChar := keymap.Chars[ev.Code]
+	var ch rune
+	typedRunes := 0
+	if hasChar {
+		s := kc.Normal
+		if c.modifiers.Shift {
+			s = kc.Shifted
+		}
+		ch, _ = utf8.DecodeRuneInString(s)
+		typedRunes = utf8.RuneCountInString(s)
+	} else if ev.Code == evdev.KEY_ENTER || ev.Code == evdev.KEY_KPENTER || ev.Code == evdev.KEY_TAB {
+		typedRunes = 1
+	}
+
 	// A chord with Ctrl/Alt/Super is a shortcut, not text: whatever it
 	// did (paste, delete-word, switch tab...) the buffer no longer
 	// reflects the screen.
 	if c.modifiers.Ctrl || c.modifiers.Alt || c.modifiers.Meta {
+		c.clearPending()
 		c.clearWord()
 		c.suppressed = true
 		c.undo.active = false
@@ -298,6 +369,10 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	}
 
 	if ev.Code == evdev.KEY_BACKSPACE {
+		// Backspace changes or removes the suffix in a way that may expose
+		// unobserved text. Keep the conservative editing/undo path instead of
+		// trying to apply an older correction around it.
+		c.clearPending()
 		if c.undo.active && ev.Value == 1 {
 			// The physical Backspace has just deleted the separator; we
 			// delete the corrected word and restore what was typed.
@@ -312,6 +387,10 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 		c.undo.active = false
 		if len(c.buf) > 0 {
 			c.buf = c.buf[:len(c.buf)-1]
+			// Do not clear suppressed here: emptying a temporary typed token
+			// can leave the cursor back in text we never observed (e.g.
+			// Backspace into existing text, type a letter, delete it).
+			// Suppression lifts on a real boundary or Reset/openers.
 		} else {
 			// Deleting into text we did not observe.
 			c.suppressed = true
@@ -322,19 +401,27 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 	// Any key other than Backspace commits the previous correction.
 	c.undo.active = false
 
-	kc, hasChar := keymap.Chars[ev.Code]
-	var ch rune
-	if hasChar {
-		s := kc.Normal
-		if c.modifiers.Shift {
-			s = kc.Shifted
+	if c.pending != nil {
+		if c.pending.SuffixRunes == 0 {
+			// Enter/Tab plans delete and retype their separator, so they cannot
+			// safely survive text typed after them.
+			c.clearPending()
+		} else if typedRunes > 0 {
+			// The focused application has already received these runes. Keep
+			// them in place by moving over the whole observed suffix when the
+			// deferred correction is eventually applied.
+			c.pending.SuffixRunes += typedRunes
+			if _, _, boundary := c.separator(ev.Code, ch, hasChar); boundary {
+				// Cursor motion can be ignored while a separator is physically
+				// held, including a later boundary in the tracked suffix.
+				c.heldSep = ev.Code
+			}
 		}
-		ch, _ = utf8.DecodeRuneInString(s)
 	}
 
 	// Word boundary?
 	if sep, correctHere, ok := c.separator(ev.Code, ch, hasChar); ok {
-		return c.commitWord(correctHere, sep)
+		return c.commitWord(correctHere, sep, ev.Code)
 	}
 
 	// AltGr diacritics: the user typed a Polish letter directly.
@@ -345,13 +432,13 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 				r = unicode.ToUpper(r)
 			}
 			c.appendRune(r, true)
-			return Result{}
+			return c.maybeReleasePending()
 		}
 		// AltGr chord we do not understand (e.g. AltGr+u = € on some
 		// layouts): the buffer no longer matches the screen.
 		c.clearWord()
 		c.suppressed = true
-		return Result{}
+		return c.maybeReleasePending()
 	}
 
 	if hasChar {
@@ -360,32 +447,33 @@ func (c *Corrector) HandleEvent(ev KeyEvent) Result {
 				ch = unicode.ToUpper(ch)
 			}
 			c.appendRune(ch, true)
-			return Result{}
+			return c.maybeReleasePending()
 		}
 		if ch >= 'A' && ch <= 'Z' {
 			if c.modifiers.Caps {
 				ch = unicode.ToLower(ch)
 			}
 			c.appendRune(ch, true)
-			return Result{}
+			return c.maybeReleasePending()
 		}
 		switch ch {
 		case '(', '[', '{':
 			// Openers start a fresh word context.
 			c.clearWord()
 			c.suppressed = false
-			return Result{}
+			return c.maybeReleasePending()
 		}
 		// Every other printable character (digits, '-', "'", '/', '@',
 		// ...) joins the token but marks it uncorrectable: identifiers,
 		// paths, e-mails, contractions and hyphenated compounds are
 		// never rewritten.
 		c.appendRune(ch, false)
-		return Result{}
+		return c.maybeReleasePending()
 	}
 
 	// Unknown or navigation key (arrows, Home/End, Delete, F-keys,
 	// keypad...): the cursor may have moved — the buffer is unreliable.
+	c.clearPending()
 	c.clearWord()
 	c.suppressed = true
 	return Result{}
@@ -405,7 +493,7 @@ func (c *Corrector) appendRune(r rune, pure bool) {
 
 // commitWord handles a word boundary: possibly produce a correction plan,
 // then reset per-word state.
-func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
+func (c *Corrector) commitWord(correctHere bool, sep rune, sepCode evdev.EvCode) Result {
 	word := c.buf
 	suppressed := c.suppressed
 	impure := c.impure || c.overflow
@@ -414,6 +502,13 @@ func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
 		c.clearWord()
 		c.suppressed = false
 	}()
+
+	if c.pending != nil {
+		// Preserve the older correction and its now-known suffix. A second
+		// correction is intentionally skipped until the first edit is emitted;
+		// overwriting it would lose the original word's dictionary decision.
+		return c.maybeReleasePending()
+	}
 
 	if !correctHere || suppressed || impure {
 		return Result{}
@@ -459,22 +554,33 @@ func (c *Corrector) commitWord(correctHere bool, sep rune) Result {
 		return Result{}
 	}
 
-	plan := &Plan{
-		Backspaces: len(word) + 1, // the word plus the separator
-		Type:       cased + string(sep),
-		Restore:    typed + string(sep),
+	// Space/punctuation are already on screen. Keep the separator and every
+	// observed following rune in place: deleting and retyping the boundary
+	// races with physical input while Apply runs. Cursor motion is only safe
+	// after the currently held separator is released and input settles.
+	keepSeparator := sep != '\n' && sep != '\t'
+	plan := &Plan{Backspaces: len(word), Type: cased, Restore: typed}
+	if !keepSeparator {
+		plan.Backspaces++
+		plan.Type += string(sep)
+		plan.Restore += string(sep)
+	} else {
+		plan.SuffixRunes = 1
 	}
 	var undo undoState
 	if c.opts.Undo {
 		undo = undoState{active: true, typed: typed, emitted: cased, outRunes: utf8.RuneCountInString(cased)}
 	}
-	if c.modifiers.Shift || c.modifiers.AltGr {
-		// Shift/AltGr is physically held (shifted separator, or a fast
-		// typist still holding AltGr): compositors merge modifier state
-		// across keyboards, so typing now would garble the output. Defer
-		// until the modifier is released.
+	// Defer until the separator key is released (and Shift/AltGr are up).
+	// Enter/Tab also wait when a modifier is held so virtual typing is not
+	// altered by merged compositor modifier state.
+	deferForSep := keepSeparator
+	if deferForSep || c.modifiers.Shift || c.modifiers.AltGr {
 		c.pending = plan
 		c.pendingUndo = undo
+		if deferForSep {
+			c.heldSep = sepCode
+		}
 		return Result{}
 	}
 	c.undo = undo

@@ -180,8 +180,15 @@ conservative". Both can be enabled in config.
 Hyphens and apostrophes join the token but mark it impure, so
 `biało-czerwony` typed as `bialo-czerwony` and `O'Brien` are never touched.
 Opening brackets/quotes reset the buffer, so `"zolw"` and `(zolw)` still
-correct the inner word. The replacement always re-types the exact separator
-character that triggered it.
+correct the inner word. Space/punctuation corrections are deferred until the
+separator key is released. A short, non-blocking settle timer then lets the
+compositor finish releasing the physical key. Printable input during rollover
+or settling extends a counted suffix and renews the timer; shortcuts,
+navigation, and Backspace still invalidate the edit conservatively. Once
+settled, the writer moves left across the full suffix, replaces only the word,
+and moves back without deleting or retyping the separator or following text.
+Opt-in Enter/Tab correction may still run on key-down when no deferral gate
+applies.
 
 ## Case preservation
 
@@ -207,7 +214,9 @@ emit Shift, so `ZOLW` typed with Caps Lock also outputs uppercase correctly.
 1. **uinput / Polish Programmer** (primary): ASCII via the US reverse map,
    Polish diacritics via AltGr(+Shift) combinations (`ż`=AltGr+Z,
    `ź`=AltGr+X, …). Fastest path, no subprocess, works because KDE applies
-   the user's layout to the virtual keyboard.
+   the user's layout to the virtual keyboard. Short sleeps around AltGr
+   chords (including Shift+AltGr uppercase diacritics) keep diacritics in
+   order; Shift-only ASCII is not delayed.
 2. **wtype** (fallback for text the uinput map cannot produce, or when
    `output: wtype` is forced). Only ever spawned during an actual
    correction, never per keystroke, and never on the reader goroutines.

@@ -65,9 +65,10 @@ type Backend interface {
 // Edit describes one replacement at the cursor. Restore must be the exact
 // text covered by Backspaces so it can be put back after a safe failure.
 type Edit struct {
-	Backspaces int
-	Text       string
-	Restore    string
+	Backspaces  int
+	Text        string
+	Restore     string
+	SuffixRunes int // keep this many already-typed runes immediately after the edit
 }
 
 // Uinput types text through virtual key events, using AltGr combinations
@@ -76,9 +77,18 @@ type Edit struct {
 type Uinput struct {
 	Kbd      Keyboard
 	CapsLock func() bool
+	sleep    func(time.Duration)
 }
 
 func (u *Uinput) Name() string { return "uinput" }
+
+func (u *Uinput) pause(d time.Duration) {
+	if u.sleep != nil {
+		u.sleep(d)
+		return
+	}
+	time.Sleep(d)
+}
 
 func (u *Uinput) Validate(text string) error {
 	for _, r := range text {
@@ -119,6 +129,12 @@ func (u *Uinput) Type(text string) error {
 				return fail(fmt.Errorf("altgr down: %w", err))
 			}
 		}
+		// Compositors reorder or drop ultra-fast AltGr chords from virtual
+		// keyboards; short gaps keep diacritics in typing order. Shift-only
+		// ASCII does not need this delay.
+		if rk.AltGr {
+			u.pause(5 * time.Millisecond)
+		}
 		keyEmitted, err := keyStroke(u.Kbd, rk.Code)
 		if keyEmitted {
 			emitted++
@@ -133,6 +149,7 @@ func (u *Uinput) Type(text string) error {
 			return fail(fmt.Errorf("key %d: %w", rk.Code, err))
 		}
 		if rk.AltGr {
+			u.pause(5 * time.Millisecond)
 			if err := u.Kbd.KeyUp(uinput.KeyRightalt); err != nil {
 				if shift {
 					_ = u.Kbd.KeyUp(uinput.KeyLeftshift)
@@ -144,6 +161,9 @@ func (u *Uinput) Type(text string) error {
 			if err := u.Kbd.KeyUp(uinput.KeyLeftshift); err != nil {
 				return fmt.Errorf("%w: shift up: %v", ErrOutputMayBePartial, err)
 			}
+		}
+		if rk.AltGr {
+			u.pause(5 * time.Millisecond)
 		}
 	}
 	return nil
@@ -351,6 +371,44 @@ func (w *Writer) Apply(edit Edit) error {
 		return lastErr
 	}
 
+	// For word-boundary corrections the separator and possibly following text
+	// are already in the focused application. Move before the observed suffix,
+	// replace only the word, then restore the cursor after the entire suffix.
+	if edit.SuffixRunes < 0 {
+		return fmt.Errorf("negative suffix length %d", edit.SuffixRunes)
+	}
+	moveCursor := func(key, count int, operation string) (int, error) {
+		moved := 0
+		for moved < count {
+			attempt := moved + 1
+			emitted, err := keyStroke(w.Kbd, key)
+			if emitted {
+				moved++
+			}
+			if err != nil {
+				return moved, fmt.Errorf("%s %d/%d: %w", operation, attempt, count, err)
+			}
+			if !emitted {
+				return moved, fmt.Errorf("%s %d/%d: no key event emitted", operation, attempt, count)
+			}
+		}
+		return moved, nil
+	}
+
+	movedLeft, err := moveCursor(uinput.KeyLeft, edit.SuffixRunes, "move before preserved suffix")
+	if err != nil {
+		_, restoreErr := moveCursor(uinput.KeyRight, movedLeft, "restore cursor after failed suffix move")
+		return errors.Join(err, restoreErr)
+	}
+
+	moveAfter := func(operationErr error) error {
+		if edit.SuffixRunes == 0 {
+			return operationErr
+		}
+		_, err := moveCursor(uinput.KeyRight, edit.SuffixRunes, "restore cursor after preserved suffix")
+		return errors.Join(operationErr, err)
+	}
+
 	deleted := 0
 	for deleted < edit.Backspaces {
 		emitted, err := keyStroke(w.Kbd, uinput.KeyBackspace)
@@ -359,19 +417,19 @@ func (w *Writer) Apply(edit Edit) error {
 		}
 		if err != nil {
 			if emitted {
-				return fmt.Errorf("%w: backspace %d/%d: %v", ErrOutputMayBePartial, deleted, edit.Backspaces, err)
+				return moveAfter(fmt.Errorf("%w: backspace %d/%d: %v", ErrOutputMayBePartial, deleted, edit.Backspaces, err))
 			}
 			restore := lastRunes(edit.Restore, deleted)
-			return w.withRestore(fmt.Errorf("backspace %d/%d: %w", deleted+1, edit.Backspaces, err), restore)
+			return moveAfter(w.withRestore(fmt.Errorf("backspace %d/%d: %w", deleted+1, edit.Backspaces, err), restore))
 		}
 	}
 	if err := selected.Type(edit.Text); err != nil {
 		if errors.Is(err, ErrOutputMayBePartial) {
-			return fmt.Errorf("output backend %s: %w", selected.Name(), err)
+			return moveAfter(fmt.Errorf("output backend %s: %w", selected.Name(), err))
 		}
-		return w.withRestore(fmt.Errorf("output backend %s: %w", selected.Name(), err), edit.Restore)
+		return moveAfter(w.withRestore(fmt.Errorf("output backend %s: %w", selected.Name(), err), edit.Restore))
 	}
-	return nil
+	return moveAfter(nil)
 }
 
 func lastRunes(s string, n int) string {

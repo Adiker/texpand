@@ -66,6 +66,10 @@ func keyName(k int) string {
 		return "v"
 	case int(evdev.KEY_SPACE):
 		return "space"
+	case uinput.KeyLeft:
+		return "left"
+	case uinput.KeyRight:
+		return "right"
 	default:
 		return "?"
 	}
@@ -91,13 +95,29 @@ func TestUinputTypesPolishViaAltGr(t *testing.T) {
 
 func TestUinputUppercaseDiacritics(t *testing.T) {
 	kbd := &fakeKbd{}
-	u := &Uinput{Kbd: kbd}
+	var pauses []time.Duration
+	u := &Uinput{Kbd: kbd, sleep: func(d time.Duration) { pauses = append(pauses, d) }}
 	if err := u.Type("Ź"); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"down:shift", "down:altgr", "down:x", "up:x", "up:altgr", "up:shift"}
 	if !slices.Equal(kbd.log, want) {
 		t.Fatalf("log = %v, want %v", kbd.log, want)
+	}
+	if wantPauses := []time.Duration{5 * time.Millisecond, 5 * time.Millisecond, 5 * time.Millisecond}; !slices.Equal(pauses, wantPauses) {
+		t.Fatalf("pauses = %v, want %v", pauses, wantPauses)
+	}
+}
+
+func TestUinputDoesNotDelayShiftOnlyASCII(t *testing.T) {
+	kbd := &fakeKbd{}
+	var pauses []time.Duration
+	u := &Uinput{Kbd: kbd, sleep: func(d time.Duration) { pauses = append(pauses, d) }}
+	if err := u.Type("ABC!"); err != nil {
+		t.Fatal(err)
+	}
+	if len(pauses) != 0 {
+		t.Fatalf("shift-only ASCII pauses = %v", pauses)
 	}
 }
 
@@ -160,6 +180,23 @@ func TestWriterFallbackChain(t *testing.T) {
 	}
 	if !slices.Equal(second.typed, []string{"żółw"}) {
 		t.Fatalf("second backend got %v", second.typed)
+	}
+}
+
+func TestWriterPreservesSuffixAroundReplacement(t *testing.T) {
+	kbd := &fakeKbd{}
+	w := &Writer{Kbd: kbd, Backends: []Backend{&Uinput{Kbd: kbd}}}
+	if err := w.Apply(Edit{Backspaces: 3, Text: "x", Restore: "abc", SuffixRunes: 3}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"down:left", "up:left", "down:left", "up:left", "down:left", "up:left",
+		"down:bs", "up:bs", "down:bs", "up:bs", "down:bs", "up:bs",
+		"down:x", "up:x",
+		"down:right", "up:right", "down:right", "up:right", "down:right", "up:right",
+	}
+	if !slices.Equal(kbd.log, want) {
+		t.Fatalf("log = %v\nwant  %v", kbd.log, want)
 	}
 }
 
