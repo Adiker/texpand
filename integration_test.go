@@ -23,7 +23,7 @@ type screen struct {
 	shift     int
 	altgr     int
 	caps      bool
-	spaceHeld int // physical Space still down — models toolkits that ignore arrows then
+	spaceHeld bool // physical Space still down — models toolkits that ignore arrows then
 }
 
 func (s *screen) insert(runes ...rune) {
@@ -76,7 +76,7 @@ func (s *screen) KeyPress(k int) error {
 		// Many Wayland clients ignore arrow keys while Space is still held.
 		// Correcting on Space key-down therefore moves Left into a no-op and
 		// backspaces eat the separator — deferral until key-up avoids that.
-		if s.spaceHeld > 0 {
+		if s.spaceHeld {
 			return nil
 		}
 		if s.cursor > 0 {
@@ -84,7 +84,7 @@ func (s *screen) KeyPress(k int) error {
 		}
 		return nil
 	case uinput.KeyRight:
-		if s.spaceHeld > 0 {
+		if s.spaceHeld {
 			return nil
 		}
 		if s.cursor < len(s.text) {
@@ -126,11 +126,12 @@ func (s *screen) String() string { return string(s.text) }
 // rig wires a corrector and writer to a shared simulated screen — the full
 // pipeline minus evdev/uinput device I/O.
 type rig struct {
-	t         *testing.T
-	scr       *screen
-	corrector *correct.Corrector
-	writer    *output.Writer
-	tracker   *inputstate.Tracker
+	t          *testing.T
+	scr        *screen
+	corrector  *correct.Corrector
+	writer     *output.Writer
+	tracker    *inputstate.Tracker
+	autoSettle bool
 }
 
 type rigLookup struct{}
@@ -158,7 +159,7 @@ func newRig(t *testing.T, opts correct.Options) *rig {
 	c.SetLookup(rigLookup{})
 	capsLock := func() bool { return tracker.Snapshot().Caps }
 	w := &output.Writer{Kbd: scr, Backends: []output.Backend{&output.Uinput{Kbd: scr, CapsLock: capsLock}}, CapsLock: capsLock}
-	return &rig{t: t, scr: scr, corrector: c, writer: w, tracker: tracker}
+	return &rig{t: t, scr: scr, corrector: c, writer: w, tracker: tracker, autoSettle: true}
 }
 
 // event feeds one raw event through the pipeline: the "app" (screen) sees
@@ -166,10 +167,10 @@ func newRig(t *testing.T, opts correct.Options) *rig {
 // corrector reacts, possibly rewriting the screen through the writer.
 func (r *rig) event(code evdev.EvCode, value int32) {
 	if code == evdev.KEY_SPACE {
-		if value >= 1 {
-			r.scr.spaceHeld++
-		} else if r.scr.spaceHeld > 0 {
-			r.scr.spaceHeld--
+		if value == 1 {
+			r.scr.spaceHeld = true
+		} else if value == 0 {
+			r.scr.spaceHeld = false
 		}
 	}
 	if value >= 1 {
@@ -191,6 +192,9 @@ func (r *rig) event(code evdev.EvCode, value int32) {
 	}
 	mods := r.tracker.Handle("kbd", code, value)
 	res := r.corrector.HandleEvent(correct.KeyEvent{Code: code, Value: value, Modifiers: mods})
+	if res.Settle && r.autoSettle {
+		res = r.corrector.ReleasePending()
+	}
 	if res.Plan != nil {
 		edit := output.Edit{
 			Backspaces:     res.Plan.Backspaces,
@@ -266,6 +270,33 @@ func TestEndToEndTwoCorrectionsInSameField(t *testing.T) {
 	r.expect("żółw żółw ")
 	r.typeString("zrodlo ")
 	r.expect("żółw żółw źródło ")
+}
+
+func TestEndToEndNextKeyCancelsSettlingCorrection(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.autoSettle = false
+	r.typeString("zolw")
+	r.event(evdev.KEY_SPACE, 1)
+	r.event(evdev.KEY_SPACE, 0)
+	r.key(evdev.KEY_A)
+	if res := r.corrector.ReleasePending(); res.Plan != nil {
+		t.Fatalf("stale plan after next key = %+v", res.Plan)
+	}
+	r.expect("zolw a")
+}
+
+func TestEndToEndSeparatorRepeatReleasesHeldState(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.typeString("zolw")
+	r.event(evdev.KEY_SPACE, 1)
+	r.event(evdev.KEY_SPACE, 2)
+	r.event(evdev.KEY_SPACE, 0)
+	r.expect("zolw  ")
+
+	// A repeat does not represent another physical key-down. The following
+	// correction must therefore be able to move Left after the single key-up.
+	r.typeString("zolw ")
+	r.expect("zolw  żółw ")
 }
 
 func TestEndToEndUndo(t *testing.T) {

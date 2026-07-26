@@ -77,9 +77,18 @@ type Edit struct {
 type Uinput struct {
 	Kbd      Keyboard
 	CapsLock func() bool
+	sleep    func(time.Duration)
 }
 
 func (u *Uinput) Name() string { return "uinput" }
+
+func (u *Uinput) pause(d time.Duration) {
+	if u.sleep != nil {
+		u.sleep(d)
+		return
+	}
+	time.Sleep(d)
+}
 
 func (u *Uinput) Validate(text string) error {
 	for _, r := range text {
@@ -121,9 +130,10 @@ func (u *Uinput) Type(text string) error {
 			}
 		}
 		// Compositors reorder or drop ultra-fast AltGr chords from virtual
-		// keyboards; a short gap keeps diacritics in typing order.
-		if shift || rk.AltGr {
-			time.Sleep(5 * time.Millisecond)
+		// keyboards; short gaps keep diacritics in typing order. Shift-only
+		// ASCII does not need this delay.
+		if rk.AltGr {
+			u.pause(5 * time.Millisecond)
 		}
 		keyEmitted, err := keyStroke(u.Kbd, rk.Code)
 		if keyEmitted {
@@ -139,7 +149,7 @@ func (u *Uinput) Type(text string) error {
 			return fail(fmt.Errorf("key %d: %w", rk.Code, err))
 		}
 		if rk.AltGr {
-			time.Sleep(5 * time.Millisecond)
+			u.pause(5 * time.Millisecond)
 			if err := u.Kbd.KeyUp(uinput.KeyRightalt); err != nil {
 				if shift {
 					_ = u.Kbd.KeyUp(uinput.KeyLeftshift)
@@ -152,8 +162,8 @@ func (u *Uinput) Type(text string) error {
 				return fmt.Errorf("%w: shift up: %v", ErrOutputMayBePartial, err)
 			}
 		}
-		if shift || rk.AltGr {
-			time.Sleep(5 * time.Millisecond)
+		if rk.AltGr {
+			u.pause(5 * time.Millisecond)
 		}
 	}
 	return nil
@@ -365,10 +375,6 @@ func (w *Writer) Apply(edit Edit) error {
 	// application. Move before it, replace only the word, then move back so
 	// the separator is preserved instead of being retyped asynchronously.
 	if edit.PreserveSuffix {
-		// evdev delivers key-up to texpand before the compositor finishes
-		// releasing the physical separator; Left while it is still held is
-		// ignored and backspaces then eat the separator.
-		time.Sleep(10 * time.Millisecond)
 		if emitted, err := keyStroke(w.Kbd, uinput.KeyLeft); err != nil {
 			return fmt.Errorf("move before preserved suffix: %w", err)
 		} else if !emitted {

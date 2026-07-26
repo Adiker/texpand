@@ -26,6 +26,8 @@ var (
 	debugUnsafe bool
 )
 
+const correctionSettleDelay = 10 * time.Millisecond
+
 func init() {
 	if version == "dev" {
 		if info, ok := debug.ReadBuildInfo(); ok {
@@ -206,8 +208,32 @@ func run() error {
 
 	configDebounce := newStoppedTimer()
 	keyboardDebounce := newStoppedTimer()
+	correctionSettle := newStoppedTimer()
 	keyboardRescan := time.NewTicker(5 * time.Second)
 	defer keyboardRescan.Stop()
+
+	applyCorrection := func(res correct.Result) {
+		if res.Plan == nil {
+			return
+		}
+		dbgUnsafe("correction: -%d chars, +%q (undo=%v preserve=%v)", res.Plan.Backspaces, res.Plan.Type, res.Undo, res.Plan.PreserveSuffix)
+		edit := output.Edit{
+			Backspaces:     res.Plan.Backspaces,
+			Text:           res.Plan.Type,
+			Restore:        res.Plan.Restore,
+			PreserveSuffix: res.Plan.PreserveSuffix,
+		}
+		if err := ac.writer.Apply(edit); err != nil {
+			fmt.Fprintf(os.Stderr, "texpand: correction output failed: %v\n", err)
+			// The corrector prepared undo state before output ran. It is
+			// no longer trustworthy after any failed edit or recovery.
+			ac.corrector.Invalidate()
+		}
+		// Our own uinput echo is invisible here (the virtual device is never
+		// monitored). Clear the expander's view; queued physical events remain
+		// valid and are processed next.
+		expander.ResetInputState()
+	}
 
 	for {
 		select {
@@ -237,25 +263,12 @@ func run() error {
 				ac.notifyToggle(enabled)
 				fmt.Printf("texpand: autocorrect %s (keyboard shortcut)\n", onOff(enabled))
 			}
-			if res.Plan != nil {
-				dbgUnsafe("correction: -%d chars, +%q (undo=%v preserve=%v)", res.Plan.Backspaces, res.Plan.Type, res.Undo, res.Plan.PreserveSuffix)
-				edit := output.Edit{
-					Backspaces:     res.Plan.Backspaces,
-					Text:           res.Plan.Type,
-					Restore:        res.Plan.Restore,
-					PreserveSuffix: res.Plan.PreserveSuffix,
-				}
-				if err := ac.writer.Apply(edit); err != nil {
-					fmt.Fprintf(os.Stderr, "texpand: correction output failed: %v\n", err)
-					// The corrector prepared undo state before output ran. It is
-					// no longer trustworthy after any failed edit or recovery.
-					ac.corrector.Invalidate()
-				}
-				// Our own uinput echo is invisible here (the virtual
-				// device is never monitored). Clear the expander's view;
-				// queued physical events remain valid and are processed next.
-				expander.ResetInputState()
+			if res.Settle {
+				resetTimer(correctionSettle, correctionSettleDelay)
 			}
+			applyCorrection(res)
+		case <-correctionSettle.C:
+			applyCorrection(ac.corrector.ReleasePending())
 		case result := <-ac.dictCh:
 			ac.handleDictLoadResult(result)
 		case <-ac.loadReq:

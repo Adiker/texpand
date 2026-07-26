@@ -46,6 +46,9 @@ type Plan struct {
 type Result struct {
 	// Plan, if non-nil, is a correction (or undo) to execute.
 	Plan *Plan
+	// Settle asks the caller to start a short, non-blocking settle timer.
+	// ReleasePending returns the plan if no intervening key invalidated it.
+	Settle bool
 	// Toggled is true when the toggle shortcut was pressed; the caller
 	// flips the enabled state.
 	Toggled bool
@@ -130,8 +133,8 @@ type Corrector struct {
 	// pending holds a correction that must not run yet. Gates: the separator
 	// key still down (Left while held is ignored), Shift/AltGr (compositors
 	// merge them into virtual typing), and Ctrl/Alt/Meta (Backspace would
-	// become a shortcut). Released on separator/modifier key-up; any other
-	// key-down drops the plan.
+	// become a shortcut). Separator/modifier key-up starts a settle interval;
+	// any other key-down drops the plan before it is emitted.
 	pending     *Plan
 	pendingUndo undoState
 	heldSep     evdev.EvCode // non-zero while the gating separator is down
@@ -213,13 +216,32 @@ func (c *Corrector) clearWord() {
 	c.overflow = false
 }
 
-// maybeReleasePending emits a deferred correction once the separator key
-// and every dangerous modifier have been released. Shift/AltGr would garble
-// virtual typing; Ctrl/Alt/Meta would turn Backspace into a shortcut.
-func (c *Corrector) maybeReleasePending() Result {
+func (c *Corrector) pendingBlocked() bool {
 	if c.pending == nil || c.heldSep != 0 ||
 		c.modifiers.Shift || c.modifiers.AltGr ||
 		c.modifiers.Ctrl || c.modifiers.Alt || c.modifiers.Meta {
+		return true
+	}
+	return false
+}
+
+// maybeReleasePending emits Enter/Tab corrections immediately once every
+// dangerous modifier is up. PreserveSuffix edits first ask the caller for a
+// non-blocking settle interval, so a following physical key can cancel them.
+func (c *Corrector) maybeReleasePending() Result {
+	if c.pendingBlocked() {
+		return Result{}
+	}
+	if c.pending.PreserveSuffix {
+		return Result{Settle: true}
+	}
+	return c.ReleasePending()
+}
+
+// ReleasePending emits a correction after the caller's settle timer fires.
+// Any intervening key-down clears pending before this method can return it.
+func (c *Corrector) ReleasePending() Result {
+	if c.pendingBlocked() {
 		return Result{}
 	}
 	plan := c.pending

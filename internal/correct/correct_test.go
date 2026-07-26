@@ -43,6 +43,9 @@ type driver struct {
 	t       *testing.T
 	c       *Corrector
 	tracker *inputstate.Tracker
+	// autoSettle releases timer-gated plans immediately for tests that do not
+	// exercise the settling window itself.
+	autoSettle bool
 	// every non-empty result, in order
 	results []Result
 }
@@ -50,7 +53,7 @@ type driver struct {
 func newDriver(t *testing.T, opts Options) *driver {
 	c := New(opts)
 	c.SetLookup(testLookup())
-	return &driver{t: t, c: c, tracker: inputstate.New(false)}
+	return &driver{t: t, c: c, tracker: inputstate.New(false), autoSettle: true}
 }
 
 // send feeds one event, recording any non-empty result (plans can surface
@@ -62,6 +65,9 @@ func (d *driver) send(code evdev.EvCode, value int32) Result {
 func (d *driver) sendDevice(device string, code evdev.EvCode, value int32) Result {
 	mods := d.tracker.Handle(device, code, value)
 	r := d.c.HandleEvent(KeyEvent{Code: code, Value: value, Modifiers: mods})
+	if r.Settle && d.autoSettle {
+		r = d.c.ReleasePending()
+	}
 	if r.Plan != nil || r.Toggled {
 		d.results = append(d.results, r)
 	}
@@ -367,17 +373,40 @@ func TestAltGrHeldDefersCorrection(t *testing.T) {
 }
 
 func TestSeparatorCorrectionDefersUntilKeyUp(t *testing.T) {
-	// Correction runs on separator key-up so Left (PreserveSuffix) is not
-	// ignored while Space is still held.
+	// Key-up starts a non-blocking settle interval. The caller releases the
+	// plan after the compositor has finished releasing physical Space.
 	d := newDriver(t, DefaultOptions())
+	d.autoSettle = false
 	d.typeString("zolw")
 	if r := d.send(evdev.KEY_SPACE, 1); r.Plan != nil {
 		t.Fatal("plan emitted while Space held")
 	}
 	r := d.send(evdev.KEY_SPACE, 0)
-	if r.Plan == nil || r.Plan.Type != "żółw" || r.Plan.Backspaces != 4 || !r.Plan.PreserveSuffix {
-		t.Fatalf("plan on Space release = %+v", r.Plan)
+	if !r.Settle || r.Plan != nil {
+		t.Fatalf("key-up result = %+v, want settle request", r)
 	}
+	r = d.c.ReleasePending()
+	if r.Plan == nil || r.Plan.Type != "żółw" || r.Plan.Backspaces != 4 || !r.Plan.PreserveSuffix {
+		t.Fatalf("plan after settle = %+v", r.Plan)
+	}
+}
+
+func TestSettlingCorrectionCancelledByNextKey(t *testing.T) {
+	d := newDriver(t, DefaultOptions())
+	d.autoSettle = false
+	d.typeString("zolw")
+	d.send(evdev.KEY_SPACE, 1)
+	if r := d.send(evdev.KEY_SPACE, 0); !r.Settle {
+		t.Fatalf("key-up result = %+v, want settle request", r)
+	}
+
+	// The application already received this key. It must invalidate the edit
+	// before the timer can move the cursor and backspace from the wrong place.
+	d.send(evdev.KEY_A, 1)
+	if r := d.c.ReleasePending(); r.Plan != nil {
+		t.Fatalf("stale plan after next key = %+v", r.Plan)
+	}
+	d.send(evdev.KEY_A, 0)
 }
 
 func TestPendingCancelledByCtrlBeforeSeparatorRelease(t *testing.T) {
