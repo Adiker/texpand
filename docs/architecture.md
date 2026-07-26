@@ -182,9 +182,11 @@ Hyphens and apostrophes join the token but mark it impure, so
 Opening brackets/quotes reset the buffer, so `"zolw"` and `(zolw)` still
 correct the inner word. Space/punctuation corrections are deferred until the
 separator key is released. A short, non-blocking settle timer then lets the
-compositor finish releasing the physical key; any intervening key-down cancels
-the pending edit. Once settled, the writer moves left, replaces only the word,
-and moves back (`PreserveSuffix`) without deleting or retyping the separator.
+compositor finish releasing the physical key. Printable input during rollover
+or settling extends a counted suffix and renews the timer; shortcuts,
+navigation, and Backspace still invalidate the edit conservatively. Once
+settled, the writer moves left across the full suffix, replaces only the word,
+and moves back without deleting or retyping the separator or following text.
 Opt-in Enter/Tab correction may still run on key-down when no deferral gate
 applies.
 

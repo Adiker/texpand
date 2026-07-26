@@ -195,17 +195,25 @@ func (r *rig) event(code evdev.EvCode, value int32) {
 	if res.Settle && r.autoSettle {
 		res = r.corrector.ReleasePending()
 	}
+	r.applyResult(res)
+}
+
+func (r *rig) applyResult(res correct.Result) {
 	if res.Plan != nil {
 		edit := output.Edit{
-			Backspaces:     res.Plan.Backspaces,
-			Text:           res.Plan.Type,
-			Restore:        res.Plan.Restore,
-			PreserveSuffix: res.Plan.PreserveSuffix,
+			Backspaces:  res.Plan.Backspaces,
+			Text:        res.Plan.Type,
+			Restore:     res.Plan.Restore,
+			SuffixRunes: res.Plan.SuffixRunes,
 		}
 		if err := r.writer.Apply(edit); err != nil {
 			r.t.Fatalf("writer: %v", err)
 		}
 	}
+}
+
+func (r *rig) settle() {
+	r.applyResult(r.corrector.ReleasePending())
 }
 
 func (r *rig) key(code evdev.EvCode) {
@@ -272,31 +280,73 @@ func TestEndToEndTwoCorrectionsInSameField(t *testing.T) {
 	r.expect("żółw żółw źródło ")
 }
 
-func TestEndToEndNextKeyCancelsSettlingCorrection(t *testing.T) {
+func TestEndToEndRolloverBeforeSeparatorKeyUp(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.autoSettle = false
+	r.typeString("zolw")
+	r.event(evdev.KEY_SPACE, 1)
+	r.event(evdev.KEY_A, 1)
+	r.event(evdev.KEY_SPACE, 0)
+	r.event(evdev.KEY_A, 0)
+	r.settle()
+	r.expect("żółw a")
+}
+
+func TestEndToEndNextKeyDuringSettleIsPreserved(t *testing.T) {
 	r := newRig(t, correct.DefaultOptions())
 	r.autoSettle = false
 	r.typeString("zolw")
 	r.event(evdev.KEY_SPACE, 1)
 	r.event(evdev.KEY_SPACE, 0)
 	r.key(evdev.KEY_A)
-	if res := r.corrector.ReleasePending(); res.Plan != nil {
-		t.Fatalf("stale plan after next key = %+v", res.Plan)
-	}
-	r.expect("zolw a")
+	r.settle()
+	r.expect("żółw a")
 }
 
-func TestEndToEndSeparatorRepeatReleasesHeldState(t *testing.T) {
+func TestEndToEndContinuousFollowingWordIsPreserved(t *testing.T) {
 	r := newRig(t, correct.DefaultOptions())
+	r.autoSettle = false
+	r.typeString("zolw ")
+	r.typeString("witam")
+	r.settle()
+	r.expect("żółw witam")
+}
+
+func TestEndToEndSeparatorRepeatIsPreserved(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.autoSettle = false
 	r.typeString("zolw")
 	r.event(evdev.KEY_SPACE, 1)
 	r.event(evdev.KEY_SPACE, 2)
 	r.event(evdev.KEY_SPACE, 0)
-	r.expect("zolw  ")
+	r.settle()
+	r.expect("żółw  ")
 
-	// A repeat does not represent another physical key-down. The following
-	// correction must therefore be able to move Left after the single key-up.
+	// A repeat is one physical hold but inserts another suffix rune. The next
+	// correction must still see Space as released after the single key-up.
+	r.autoSettle = true
 	r.typeString("zolw ")
-	r.expect("zolw  żółw ")
+	r.expect("żółw  żółw ")
+}
+
+func TestEndToEndUndoAfterManualSettle(t *testing.T) {
+	r := newRig(t, correct.DefaultOptions())
+	r.autoSettle = false
+	r.typeString("zolw ")
+	r.settle()
+	r.expect("żółw ")
+	r.key(evdev.KEY_BACKSPACE)
+	r.expect("zolw")
+
+	// Once text follows the separator, Backspace edits that suffix and must
+	// not restore the original ASCII word as if the correction were adjacent.
+	r = newRig(t, correct.DefaultOptions())
+	r.autoSettle = false
+	r.typeString("zolw a")
+	r.settle()
+	r.expect("żółw a")
+	r.key(evdev.KEY_BACKSPACE)
+	r.expect("żółw ")
 }
 
 func TestEndToEndUndo(t *testing.T) {

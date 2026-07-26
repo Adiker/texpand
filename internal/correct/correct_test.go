@@ -386,12 +386,12 @@ func TestSeparatorCorrectionDefersUntilKeyUp(t *testing.T) {
 		t.Fatalf("key-up result = %+v, want settle request", r)
 	}
 	r = d.c.ReleasePending()
-	if r.Plan == nil || r.Plan.Type != "żółw" || r.Plan.Backspaces != 4 || !r.Plan.PreserveSuffix {
+	if r.Plan == nil || r.Plan.Type != "żółw" || r.Plan.Backspaces != 4 || r.Plan.SuffixRunes != 1 {
 		t.Fatalf("plan after settle = %+v", r.Plan)
 	}
 }
 
-func TestSettlingCorrectionCancelledByNextKey(t *testing.T) {
+func TestSettlingCorrectionTracksNextKey(t *testing.T) {
 	d := newDriver(t, DefaultOptions())
 	d.autoSettle = false
 	d.typeString("zolw")
@@ -400,11 +400,13 @@ func TestSettlingCorrectionCancelledByNextKey(t *testing.T) {
 		t.Fatalf("key-up result = %+v, want settle request", r)
 	}
 
-	// The application already received this key. It must invalidate the edit
-	// before the timer can move the cursor and backspace from the wrong place.
-	d.send(evdev.KEY_A, 1)
-	if r := d.c.ReleasePending(); r.Plan != nil {
-		t.Fatalf("stale plan after next key = %+v", r.Plan)
+	// The application already received this key. The correction must keep it
+	// as a second suffix rune rather than discarding the dictionary decision.
+	if r := d.send(evdev.KEY_A, 1); !r.Settle {
+		t.Fatalf("next key result = %+v, want renewed settle request", r)
+	}
+	if r := d.c.ReleasePending(); r.Plan == nil || r.Plan.SuffixRunes != 2 {
+		t.Fatalf("plan after next key = %+v, want two suffix runes", r.Plan)
 	}
 	d.send(evdev.KEY_A, 0)
 }
@@ -420,10 +422,11 @@ func TestPendingCancelledByCtrlBeforeSeparatorRelease(t *testing.T) {
 	d.send(evdev.KEY_LEFTCTRL, 0)
 }
 
-func TestPendingPlanCancelledByNextKey(t *testing.T) {
-	// User keeps Shift held and types more: the deferred correction must
-	// be dropped, not applied to text that moved on.
+func TestPendingPlanTracksRolloverKey(t *testing.T) {
+	// User keeps Shift held and types more before releasing the punctuation
+	// separator. The following character becomes part of the preserved suffix.
 	d := newDriver(t, DefaultOptions())
+	d.autoSettle = false
 	d.typeString("zolw")
 	d.send(evdev.KEY_LEFTSHIFT, 1)
 	d.send(evdev.KEY_1, 1) // '!' → pending
@@ -431,8 +434,12 @@ func TestPendingPlanCancelledByNextKey(t *testing.T) {
 	d.send(evdev.KEY_A, 1) // still shifted: "A"
 	d.send(evdev.KEY_A, 0)
 	r := d.send(evdev.KEY_LEFTSHIFT, 0)
-	if r.Plan != nil {
-		t.Fatalf("stale pending plan emitted: %+v", r.Plan)
+	if !r.Settle {
+		t.Fatalf("shift release = %+v, want settle request", r)
+	}
+	r = d.c.ReleasePending()
+	if r.Plan == nil || r.Plan.SuffixRunes != 2 {
+		t.Fatalf("rollover plan = %+v, want two suffix runes", r.Plan)
 	}
 }
 
@@ -492,10 +499,11 @@ func TestSuppressionSurvivesTempCharDelete(t *testing.T) {
 	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 
-func TestSeparatorRepeatCancelsPending(t *testing.T) {
-	// A held Space autorepeats into the app as extra separators. The deferred
-	// PreserveSuffix plan only accounts for one, so repeat must cancel it.
+func TestSeparatorRepeatExtendsPendingSuffix(t *testing.T) {
+	// A held Space autorepeats into the app as an extra suffix rune. Tracking
+	// its length keeps the correction aligned without deleting either space.
 	d := newDriver(t, DefaultOptions())
+	d.autoSettle = false
 	d.typeString("zolw")
 	if r := d.send(evdev.KEY_SPACE, 1); r.Plan != nil {
 		t.Fatal("plan on Space down")
@@ -503,10 +511,15 @@ func TestSeparatorRepeatCancelsPending(t *testing.T) {
 	if r := d.send(evdev.KEY_SPACE, 2); r.Plan != nil {
 		t.Fatal("plan on Space repeat")
 	}
-	if r := d.send(evdev.KEY_SPACE, 0); r.Plan != nil {
-		t.Fatalf("stale plan after Space repeat: %+v", r.Plan)
+	if r := d.send(evdev.KEY_SPACE, 0); !r.Settle {
+		t.Fatalf("Space release = %+v, want settle request", r)
 	}
-	// After the cancelled boundary, a fresh word still corrects.
+	r := d.c.ReleasePending()
+	if r.Plan == nil || r.Plan.SuffixRunes != 2 {
+		t.Fatalf("repeat plan = %+v, want two suffix runes", r.Plan)
+	}
+	// After the tracked boundary, a fresh word still corrects.
+	d.autoSettle = true
 	expectPlan(t, d.typeString("zolw "), 4, "żółw")
 }
 

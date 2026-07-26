@@ -65,10 +65,10 @@ type Backend interface {
 // Edit describes one replacement at the cursor. Restore must be the exact
 // text covered by Backspaces so it can be put back after a safe failure.
 type Edit struct {
-	Backspaces     int
-	Text           string
-	Restore        string
-	PreserveSuffix bool // keep the already-typed character immediately after the edit
+	Backspaces  int
+	Text        string
+	Restore     string
+	SuffixRunes int // keep this many already-typed runes immediately after the edit
 }
 
 // Uinput types text through virtual key events, using AltGr combinations
@@ -371,27 +371,42 @@ func (w *Writer) Apply(edit Edit) error {
 		return lastErr
 	}
 
-	// For word-boundary corrections the separator is already in the focused
-	// application. Move before it, replace only the word, then move back so
-	// the separator is preserved instead of being retyped asynchronously.
-	if edit.PreserveSuffix {
-		if emitted, err := keyStroke(w.Kbd, uinput.KeyLeft); err != nil {
-			return fmt.Errorf("move before preserved suffix: %w", err)
-		} else if !emitted {
-			return fmt.Errorf("move before preserved suffix: no key event emitted")
+	// For word-boundary corrections the separator and possibly following text
+	// are already in the focused application. Move before the observed suffix,
+	// replace only the word, then restore the cursor after the entire suffix.
+	if edit.SuffixRunes < 0 {
+		return fmt.Errorf("negative suffix length %d", edit.SuffixRunes)
+	}
+	moveCursor := func(key, count int, operation string) (int, error) {
+		moved := 0
+		for moved < count {
+			attempt := moved + 1
+			emitted, err := keyStroke(w.Kbd, key)
+			if emitted {
+				moved++
+			}
+			if err != nil {
+				return moved, fmt.Errorf("%s %d/%d: %w", operation, attempt, count, err)
+			}
+			if !emitted {
+				return moved, fmt.Errorf("%s %d/%d: no key event emitted", operation, attempt, count)
+			}
 		}
+		return moved, nil
+	}
+
+	movedLeft, err := moveCursor(uinput.KeyLeft, edit.SuffixRunes, "move before preserved suffix")
+	if err != nil {
+		_, restoreErr := moveCursor(uinput.KeyRight, movedLeft, "restore cursor after failed suffix move")
+		return errors.Join(err, restoreErr)
 	}
 
 	moveAfter := func(operationErr error) error {
-		if !edit.PreserveSuffix {
+		if edit.SuffixRunes == 0 {
 			return operationErr
 		}
-		if emitted, err := keyStroke(w.Kbd, uinput.KeyRight); err != nil {
-			return errors.Join(operationErr, fmt.Errorf("restore cursor after preserved suffix: %w", err))
-		} else if !emitted {
-			return errors.Join(operationErr, errors.New("restore cursor after preserved suffix: no key event emitted"))
-		}
-		return operationErr
+		_, err := moveCursor(uinput.KeyRight, edit.SuffixRunes, "restore cursor after preserved suffix")
+		return errors.Join(operationErr, err)
 	}
 
 	deleted := 0

@@ -216,12 +216,12 @@ func run() error {
 		if res.Plan == nil {
 			return
 		}
-		dbgUnsafe("correction: -%d chars, +%q (undo=%v preserve=%v)", res.Plan.Backspaces, res.Plan.Type, res.Undo, res.Plan.PreserveSuffix)
+		dbgUnsafe("correction: -%d chars, +%q (undo=%v suffix=%d)", res.Plan.Backspaces, res.Plan.Type, res.Undo, res.Plan.SuffixRunes)
 		edit := output.Edit{
-			Backspaces:     res.Plan.Backspaces,
-			Text:           res.Plan.Type,
-			Restore:        res.Plan.Restore,
-			PreserveSuffix: res.Plan.PreserveSuffix,
+			Backspaces:  res.Plan.Backspaces,
+			Text:        res.Plan.Type,
+			Restore:     res.Plan.Restore,
+			SuffixRunes: res.Plan.SuffixRunes,
 		}
 		if err := ac.writer.Apply(edit); err != nil {
 			fmt.Fprintf(os.Stderr, "texpand: correction output failed: %v\n", err)

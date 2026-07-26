@@ -186,14 +186,14 @@ func TestWriterFallbackChain(t *testing.T) {
 func TestWriterPreservesSuffixAroundReplacement(t *testing.T) {
 	kbd := &fakeKbd{}
 	w := &Writer{Kbd: kbd, Backends: []Backend{&Uinput{Kbd: kbd}}}
-	if err := w.Apply(Edit{Backspaces: 3, Text: "x", Restore: "abc", PreserveSuffix: true}); err != nil {
+	if err := w.Apply(Edit{Backspaces: 3, Text: "x", Restore: "abc", SuffixRunes: 3}); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
-		"down:left", "up:left",
+		"down:left", "up:left", "down:left", "up:left", "down:left", "up:left",
 		"down:bs", "up:bs", "down:bs", "up:bs", "down:bs", "up:bs",
 		"down:x", "up:x",
-		"down:right", "up:right",
+		"down:right", "up:right", "down:right", "up:right", "down:right", "up:right",
 	}
 	if !slices.Equal(kbd.log, want) {
 		t.Fatalf("log = %v\nwant  %v", kbd.log, want)
